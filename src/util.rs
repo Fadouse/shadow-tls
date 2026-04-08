@@ -13,6 +13,7 @@ use monoio::{
     net::{ListenerOpts, TcpListener, TcpStream},
 };
 
+use aes_gcm::{aead::AeadInPlace, aead::generic_array::typenum::U12, Aes128Gcm, KeyInit as AesKeyInit, Nonce};
 use hkdf::Hkdf;
 use hmac::Mac;
 use rand::Rng;
@@ -156,7 +157,8 @@ impl Hmac {
     pub(crate) fn new(password: &str, init_data: (&[u8], &[u8])) -> Self {
         // Note: infact new_from_slice never returns Err.
         let mut hmac: hmac::Hmac<sha1::Sha1> =
-            hmac::Hmac::new_from_slice(password.as_bytes()).expect("unable to build hmac instance");
+            <hmac::Hmac<sha1::Sha1> as Mac>::new_from_slice(password.as_bytes())
+                .expect("unable to build hmac instance");
         hmac.update(init_data.0);
         hmac.update(init_data.1);
         Self(hmac)
@@ -184,103 +186,182 @@ impl Hmac {
     }
 }
 
-/// Per-frame HMAC with independent sequence numbers and direction-separated keys.
+/// Per-frame AEAD with AES-128-GCM, independent sequence numbers, and direction-separated keys.
 ///
 /// Key derivation: HKDF-SHA256 with:
 ///   - IKM = password
 ///   - salt = server_random
 ///   - info = direction (b"c2s" or b"s2c")
+///   - output = 16-byte AES key + 12-byte base nonce (28 bytes total)
 ///
-/// Each frame is authenticated independently:
-///   tag = HMAC-SHA256(key, seq || header || payload)[..16]
+/// Each frame is encrypted and authenticated:
+///   nonce = base_nonce XOR (seq_be64 zero-padded to 12 bytes, aligned right)
+///   AAD = TLS record header (5 bytes)
+///   ciphertext || tag = AES-128-GCM(key, nonce, AAD, plaintext)
 ///
-/// `header` = TLS record header (type + version + length, 5 bytes).
+/// The 16-byte GCM tag replaces the old HMAC-SHA256 tag (same size, same wire layout).
+/// Inner payload (cmd + data_len + data + padding) is now encrypted in addition to authenticated.
+///
+/// Uses 64-bit sequence counter to eliminate nonce overflow risk at 64 TB
+/// (u32 would overflow at ~2^32 * ~16KB ≈ 64 TB of data).
+///
 /// Failed verifications do NOT advance the sequence counter, avoiding state corruption.
 /// In Authenticated state, any tag mismatch = immediate disconnect (strict seq policy).
-pub(crate) struct FrameHmac {
-    key: [u8; 32],
-    seq: u32,
+pub(crate) struct FrameAead {
+    cipher: Aes128Gcm,
+    base_nonce: [u8; 12],
+    seq: u64,
 }
 
-impl FrameHmac {
-    /// Create a new FrameHmac with HKDF-SHA256 derived, direction-separated key.
+impl FrameAead {
+    /// Create a new FrameAead with HKDF-SHA256 derived, direction-separated key and nonce.
     /// `direction` should be b"c2s" or b"s2c".
     pub(crate) fn new(password: &str, server_random: &[u8], direction: &[u8]) -> Self {
         let hk = Hkdf::<Sha256>::new(Some(server_random), password.as_bytes());
-        let mut key = [0u8; 32];
-        hk.expand(direction, &mut key)
+        // Derive 28 bytes: 16-byte AES key + 12-byte base nonce
+        let mut okm = [0u8; 28];
+        hk.expand(direction, &mut okm)
             .expect("HKDF-SHA256 expand failed");
-        Self { key, seq: 0 }
-    }
-
-    /// Compute HMAC-SHA256 tag for a frame at the current sequence number.
-    /// `header` is the 5-byte TLS record header; `payload` is the frame body after the HMAC tag.
-    fn compute_tag(&self, header: &[u8], payload: &[u8]) -> [u8; HMAC_SIZE] {
-        let mut mac: hmac::Hmac<Sha256> =
-            hmac::Hmac::new_from_slice(&self.key).expect("unable to build hmac instance");
-        mac.update(&self.seq.to_be_bytes());
-        mac.update(header);
-        mac.update(payload);
-        let hash = mac.finalize().into_bytes();
-        let mut tag = [0u8; HMAC_SIZE];
-        unsafe { copy_nonoverlapping(hash.as_slice().as_ptr(), tag.as_mut_ptr(), HMAC_SIZE) };
-        tag
-    }
-
-    /// Verify tag against frame data. Advances seq only on success.
-    /// `header` = TLS record header (5 bytes), `payload` = data after HMAC tag.
-    pub(crate) fn verify_and_advance(
-        &mut self,
-        header: &[u8],
-        payload: &[u8],
-        tag: &[u8; HMAC_SIZE],
-    ) -> bool {
-        let expected = self.compute_tag(header, payload);
-        if expected == *tag {
-            self.seq += 1;
-            true
-        } else {
-            false
+        let key: [u8; 16] = okm[..16].try_into().unwrap();
+        let mut base_nonce = [0u8; 12];
+        base_nonce.copy_from_slice(&okm[16..28]);
+        let cipher =
+            <Aes128Gcm as AesKeyInit>::new_from_slice(&key).expect("AES-128-GCM key init failed");
+        Self {
+            cipher,
+            base_nonce,
+            seq: 0,
         }
     }
 
-    /// Compute tag and advance seq. Used when sending.
-    /// `header` = TLS record header (5 bytes), `payload` = frame body.
-    pub(crate) fn tag_and_advance(&mut self, header: &[u8], payload: &[u8]) -> [u8; HMAC_SIZE] {
-        let tag = self.compute_tag(header, payload);
+    /// Build the 12-byte nonce: base_nonce XOR (seq_be64 right-aligned to 12 bytes).
+    #[inline]
+    fn make_nonce(&self) -> Nonce<U12> {
+        let mut nonce = self.base_nonce;
+        let seq_bytes = self.seq.to_be_bytes(); // 8 bytes
+        // XOR seq into the last 8 bytes of the nonce
+        nonce[4] ^= seq_bytes[0];
+        nonce[5] ^= seq_bytes[1];
+        nonce[6] ^= seq_bytes[2];
+        nonce[7] ^= seq_bytes[3];
+        nonce[8] ^= seq_bytes[4];
+        nonce[9] ^= seq_bytes[5];
+        nonce[10] ^= seq_bytes[6];
+        nonce[11] ^= seq_bytes[7];
+        *Nonce::from_slice(&nonce)
+    }
+
+    /// Encrypt payload in-place and return the 16-byte GCM tag.
+    /// `header` = TLS record header (5 bytes, used as AAD).
+    /// `payload` is modified in-place to ciphertext.
+    pub(crate) fn encrypt_and_advance(
+        &mut self,
+        header: &[u8],
+        payload: &mut [u8],
+    ) -> [u8; HMAC_SIZE] {
+        let nonce = self.make_nonce();
+        let gcm_tag = self
+            .cipher
+            .encrypt_in_place_detached(&nonce, header, payload)
+            .expect("AES-GCM encrypt failed");
         self.seq += 1;
+        let mut tag = [0u8; HMAC_SIZE];
+        tag.copy_from_slice(gcm_tag.as_slice());
         tag
+    }
+
+    /// Decrypt payload in-place and verify the GCM tag. Advances seq only on success.
+    /// `header` = TLS record header (5 bytes, used as AAD).
+    /// `payload` is modified in-place to plaintext on success.
+    pub(crate) fn decrypt_and_advance(
+        &mut self,
+        header: &[u8],
+        payload: &mut [u8],
+        tag: &[u8; HMAC_SIZE],
+    ) -> bool {
+        let nonce = self.make_nonce();
+        let gcm_tag = aes_gcm::Tag::from_slice(tag);
+        match self
+            .cipher
+            .decrypt_in_place_detached(&nonce, header, payload, gcm_tag)
+        {
+            Ok(()) => {
+                self.seq += 1;
+                true
+            }
+            Err(_) => false,
+        }
     }
 }
 
-/// Padding state for anti TLS-in-TLS.
+/// Padding state for anti TLS-in-TLS with realistic traffic distribution.
 ///
-/// Tracks how many data packets have been sent and generates target
-/// TLS record payload sizes for the first `PADDING_COUNT` packets.
-/// After that, no padding is added.
+/// Three phases:
+///   1. Packet 0: mimics HTTP request / small response (200-600 bytes)
+///   2. Packets 1-7: mimics HTTP response with small probability of full-size frames
+///      (like real HTTPS large file downloads that produce ~16KB TLS records)
+///   3. Packet 8+: low-probability (2%) random padding of 0-256 bytes on any frame,
+///      eliminating the abrupt feature change at packet boundary.
 pub(crate) struct PaddingState {
     sent: usize,
 }
+
+/// Probability (out of 100) that packets 2-7 produce a near-full-size frame.
+const FULL_FRAME_PROBABILITY: u32 = 5;
+/// Near-full-size range when triggered (mimics large HTTPS response body).
+const FULL_FRAME_RANGE: (usize, usize) = (14000, 16000);
+/// Probability (out of 100) of post-initial-phase random padding.
+const TAIL_PADDING_PROBABILITY: u32 = 2;
+/// Max tail padding bytes.
+const TAIL_PADDING_MAX: usize = 256;
 
 impl PaddingState {
     pub(crate) fn new() -> Self {
         Self { sent: 0 }
     }
 
-    /// Returns the target TLS record *payload* size (= HMAC + inner header + data + padding)
-    /// for the current packet, or None if padding is no longer needed.
-    pub(crate) fn next_target_payload(&mut self) -> Option<usize> {
-        if self.sent >= PADDING_COUNT {
-            return None;
+    /// Returns the number of padding bytes to append for the current packet.
+    /// `current_payload` = tag + inner header + data (before padding).
+    ///
+    /// For the first 8 packets: pads to a target payload size (mandatory).
+    /// After that: 2% chance of 0-256B extra padding (smooths the cutoff).
+    pub(crate) fn next_padding_len(&mut self, current_payload: usize) -> usize {
+        let mut rng = rand::thread_rng();
+
+        if self.sent < PADDING_COUNT {
+            let range = match self.sent {
+                0 => (200, 600), // HTTP request / small response
+                1 => {
+                    // HTTP response headers, with small chance of full-size
+                    if rng.gen_range(0..100u32) < FULL_FRAME_PROBABILITY {
+                        FULL_FRAME_RANGE
+                    } else {
+                        (800, 1400)
+                    }
+                }
+                _ => {
+                    // HTTP response body chunks, with small chance of full-size
+                    // (mimics real large file download producing max-size TLS records)
+                    if rng.gen_range(0..100u32) < FULL_FRAME_PROBABILITY {
+                        FULL_FRAME_RANGE
+                    } else {
+                        (500, 1400)
+                    }
+                }
+            };
+            self.sent += 1;
+            let target = rng.gen_range(range.0..=range.1);
+            target.saturating_sub(current_payload)
+        } else {
+            // Post-initial phase: low-probability tail padding (2%)
+            // Adds 0-256 random bytes to eliminate the abrupt cutoff at packet 9.
+            self.sent += 1;
+            if rng.gen_range(0..100u32) < TAIL_PADDING_PROBABILITY {
+                rng.gen_range(0..=TAIL_PADDING_MAX)
+            } else {
+                0
+            }
         }
-        let range = match self.sent {
-            0 => (200, 600),      // mimics HTTP request / small response
-            1 => (800, 1400),     // mimics HTTP response headers
-            _ => (500, 1400),     // mimics HTTP response body chunks
-        };
-        self.sent += 1;
-        let target = rand::thread_rng().gen_range(range.0..=range.1);
-        Some(target)
     }
 }
 
@@ -320,8 +401,8 @@ pub(crate) fn kdf(password: &str, server_random: &[u8]) -> Vec<u8> {
 pub(crate) async fn verified_relay(
     raw: TcpStream,
     tls: TcpStream,
-    mut hmac_add: FrameHmac,
-    mut hmac_verify: FrameHmac,
+    mut aead_encrypt: FrameAead,
+    mut aead_decrypt: FrameAead,
     alert_enabled: bool,
     auth_pending: bool,
 ) {
@@ -331,10 +412,10 @@ pub(crate) async fn verified_relay(
     let (mut notfied, mut notifier) = local_sync::oneshot::channel::<()>();
     let _ = monoio::join!(
         async {
-            copy_remove_appdata_and_verify(
+            copy_remove_appdata_and_decrypt(
                 &mut tls_read,
                 &mut raw_write,
-                &mut hmac_verify,
+                &mut aead_decrypt,
                 &mut notifier,
                 auth_pending,
             )
@@ -342,10 +423,10 @@ pub(crate) async fn verified_relay(
             let _ = raw_write.shutdown().await;
         },
         async {
-            copy_add_appdata(
+            copy_add_appdata_and_encrypt(
                 &mut raw_read,
                 &mut tls_write,
-                &mut hmac_add,
+                &mut aead_encrypt,
                 &mut notfied,
                 alert_enabled,
             )
@@ -372,22 +453,22 @@ pub(crate) fn bind_with_pretty_error<A: ToSocketAddrs>(
     })
 }
 
-/// State machine for receiving authenticated application data.
+/// State machine for receiving and decrypting authenticated application data.
 ///
 /// States:
-///   AuthPending → Authenticated (on first valid HMAC frame)
+///   AuthPending → Authenticated (on first valid GCM frame)
 ///
-/// In AuthPending: non-HMAC ApplicationData frames (e.g., NewSessionTickets
-/// from handshake server drain) are silently discarded. FrameHmac's per-frame
+/// In AuthPending: non-authenticated ApplicationData frames (e.g., NewSessionTickets
+/// from handshake server drain) are silently discarded. FrameAead's per-frame
 /// design means failed verifications do NOT corrupt state (seq stays unchanged).
 /// AuthPending has resource limits: max 64 KiB discarded and max 10 seconds.
 ///
-/// In Authenticated: ALL ApplicationData frames must have valid HMAC.
+/// In Authenticated: ALL ApplicationData frames must have valid GCM tag.
 /// Any tag mismatch = immediate disconnect (strict seq policy, no reordering).
-async fn copy_remove_appdata_and_verify(
+async fn copy_remove_appdata_and_decrypt(
     read: impl AsyncReadRent,
     mut write: impl AsyncWriteRent,
-    hmac_verify: &mut FrameHmac,
+    aead: &mut FrameAead,
     alert_notifier: &mut Receiver<()>,
     auth_pending: bool,
 ) {
@@ -456,26 +537,28 @@ async fn copy_remove_appdata_and_verify(
                     return;
                 }
 
-                let header = &frame[..TLS_HEADER_SIZE];
-                let payload = &frame[TLS_HMAC_HEADER_SIZE..];
+                let header: [u8; TLS_HEADER_SIZE] =
+                    frame[..TLS_HEADER_SIZE].try_into().unwrap();
                 let mut tag = [0u8; HMAC_SIZE];
                 tag.copy_from_slice(&frame[TLS_HEADER_SIZE..TLS_HMAC_HEADER_SIZE]);
 
-                if hmac_verify.verify_and_advance(header, payload, &tag) {
+                // Decrypt in-place: copy ciphertext to a mutable buffer
+                let mut payload = frame[TLS_HMAC_HEADER_SIZE..].to_vec();
+
+                if aead.decrypt_and_advance(&header, &mut payload, &tag) {
                     if !authenticated {
-                        tracing::debug!("auth pending → authenticated (first valid HMAC frame)");
+                        tracing::debug!("auth pending → authenticated (first valid GCM frame)");
                         authenticated = true;
                     }
-                    // Parse inner framing: [cmd:1][data_len:2][data...][padding...]
-                    let inner = &frame[TLS_HMAC_HEADER_SIZE..];
-                    match parse_inner_frame(inner) {
+                    // Parse inner framing from decrypted plaintext
+                    match parse_inner_frame(&payload) {
                         Some((CMD_DATA, data)) if !data.is_empty() => {
-                            let data_offset = TLS_HMAC_HEADER_SIZE + INNER_HEADER_SIZE;
+                            let data_offset = INNER_HEADER_SIZE;
                             let data_len = data.len();
                             let (res, _) = write
                                 .write_all(unsafe {
                                     monoio::buf::RawBuf::new(
-                                        frame.as_ptr().add(data_offset),
+                                        payload.as_ptr().add(data_offset),
                                         data_len,
                                     )
                                 })
@@ -487,11 +570,9 @@ async fn copy_remove_appdata_and_verify(
                             }
                         }
                         Some((CMD_PADDING, _)) => {
-                            // Pure padding/waste frame, discard silently
                             tracing::trace!("discarding padding frame");
                         }
                         Some((CMD_DATA, _)) => {
-                            // DATA with zero-length payload — skip
                             tracing::trace!("discarding empty data frame");
                         }
                         _ => {
@@ -501,19 +582,19 @@ async fn copy_remove_appdata_and_verify(
                         }
                     }
                 } else if !authenticated {
-                    // AuthPending: discard non-HMAC frame (NewSessionTicket etc.)
-                    // FrameHmac seq is NOT advanced on failure, so state is clean.
+                    // AuthPending: discard non-authenticated frame (NewSessionTicket etc.)
+                    // FrameAead seq is NOT advanced on failure, so state is clean.
                     pending_bytes_discarded += frame.len();
                     if pending_bytes_discarded > AUTH_PENDING_MAX_BYTES {
                         tracing::warn!("auth pending: byte limit exceeded, disconnecting");
                         alert_notifier.close();
                         return;
                     }
-                    tracing::debug!("auth pending: discarding non-HMAC ApplicationData");
+                    tracing::debug!("auth pending: discarding non-authenticated ApplicationData");
                     continue;
                 } else {
                     // Strict seq policy: any tag error in Authenticated = disconnect.
-                    tracing::warn!("authenticated: HMAC verification failed (strict disconnect)");
+                    tracing::warn!("authenticated: GCM verification failed (strict disconnect)");
                     alert_notifier.close();
                     return;
                 }
@@ -526,16 +607,20 @@ async fn copy_remove_appdata_and_verify(
     }
 }
 
-async fn copy_add_appdata(
+/// Maximum TLS record payload size (16 KiB minus overhead, safe limit).
+const COALESCE_MAX_DATA: usize = 16000;
+/// Coalescing buffer capacity: enough for max TLS record + framing overhead.
+const COALESCE_BUF_SIZE: usize = COALESCE_MAX_DATA + FRAME_OVERHEAD + 256;
+
+async fn copy_add_appdata_and_encrypt(
     mut read: impl AsyncReadRent,
     mut write: impl AsyncWriteRent,
-    hmac: &mut FrameHmac,
+    aead: &mut FrameAead,
     alert_notified: &mut Sender<()>,
     alert_enabled: bool,
 ) {
-    // Buffer layout: [TLS_HDR:5][HMAC:16][CMD:1][DATA_LEN:2][payload...][padding...]
-    let mut buffer = Vec::with_capacity(COPY_BUF_SIZE);
-    // Reserve space for TLS header + HMAC + inner header
+    // Buffer layout: [TLS_HDR:5][TAG:16][CMD:1][DATA_LEN:2][payload...][padding...]
+    let mut buffer = Vec::with_capacity(COALESCE_BUF_SIZE);
     buffer.resize(FRAME_OVERHEAD, 0);
     buffer[0] = APPLICATION_DATA;
     buffer[1] = TLS_MAJOR;
@@ -557,35 +642,60 @@ async fn copy_add_appdata(
                     return;
                 }
                 buffer = buf.into_inner();
-                let data_len = buffer.len() - FRAME_OVERHEAD;
+                let mut data_len = buffer.len() - FRAME_OVERHEAD;
+
+                // --- Frame coalescing ---
+                // After the first read, try to coalesce more data if the buffer
+                // is small (typical for web browsing with many small packets).
+                // We do another read into the remaining capacity.
+                if data_len < COALESCE_MAX_DATA {
+                    let target_cap = FRAME_OVERHEAD + COALESCE_MAX_DATA;
+                    if buffer.capacity() < target_cap {
+                        buffer.reserve(target_cap - buffer.capacity());
+                    }
+                    let current_len = buffer.len();
+                    let (res2, buf2) = read.read(buffer.slice_mut(current_len..target_cap)).await;
+                    buffer = buf2.into_inner();
+                    if let Ok(n) = res2 {
+                        if n > 0 {
+                            data_len = buffer.len() - FRAME_OVERHEAD;
+                        }
+                    }
+                }
 
                 // Write inner header: CMD_DATA + data_len
                 buffer[TLS_HMAC_HEADER_SIZE] = CMD_DATA;
                 buffer[TLS_HMAC_HEADER_SIZE + 1] = (data_len >> 8) as u8;
                 buffer[TLS_HMAC_HEADER_SIZE + 2] = data_len as u8;
 
-                // Add padding for first N packets
-                if let Some(target_payload) = padding.next_target_payload() {
-                    // target_payload = total TLS record payload (HMAC + inner_hdr + data + padding)
-                    let current_payload = HMAC_SIZE + INNER_HEADER_SIZE + data_len;
-                    if target_payload > current_payload {
-                        let pad_len = target_payload - current_payload;
-                        buffer.resize(buffer.len() + pad_len, 0);
-                        // Fill padding with random bytes
-                        rand::thread_rng().fill(&mut buffer[FRAME_OVERHEAD + data_len..]);
-                    }
+                // Add padding (initial-phase target sizing or tail-phase random)
+                let current_payload = HMAC_SIZE + INNER_HEADER_SIZE + data_len;
+                let pad_len = padding.next_padding_len(current_payload);
+                if pad_len > 0 {
+                    buffer.resize(buffer.len() + pad_len, 0);
+                    rand::thread_rng().fill(&mut buffer[FRAME_OVERHEAD + data_len..]);
                 }
 
-                // Write TLS record length
+                // Write TLS record length (before encryption, since it's AAD)
                 let frame_len = buffer.len() - TLS_HEADER_SIZE;
                 (&mut buffer[3..5])
                     .write_u16::<BigEndian>(frame_len as u16)
                     .unwrap();
 
-                // Per-frame HMAC over inner content (cmd + data_len + data + padding)
-                let header = &[buffer[0], buffer[1], buffer[2], buffer[3], buffer[4]];
-                let hmac_val = hmac.tag_and_advance(header, &buffer[TLS_HMAC_HEADER_SIZE..]);
-                unsafe { copy_nonoverlapping(hmac_val.as_ptr(), buffer.as_mut_ptr().add(TLS_HEADER_SIZE), HMAC_SIZE) };
+                // AES-128-GCM encrypt inner payload in-place, get 16-byte tag
+                let header: [u8; TLS_HEADER_SIZE] =
+                    buffer[..TLS_HEADER_SIZE].try_into().unwrap();
+                let tag = aead.encrypt_and_advance(
+                    &header,
+                    &mut buffer[TLS_HMAC_HEADER_SIZE..],
+                );
+                unsafe {
+                    copy_nonoverlapping(
+                        tag.as_ptr(),
+                        buffer.as_mut_ptr().add(TLS_HEADER_SIZE),
+                        HMAC_SIZE,
+                    )
+                };
 
                 let (res, buf) = write.write_all(buffer).await;
                 buffer = buf;

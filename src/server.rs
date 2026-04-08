@@ -26,7 +26,7 @@ use crate::{
     },
     util::{
         bind_with_pretty_error, copy_bidirectional, copy_until_eof, mod_tcp_conn, prelude::*,
-        resolve, support_tls13, verified_relay, CursorExt, FrameHmac, Hmac, V3Mode,
+        resolve, support_tls13, verified_relay, CursorExt, FrameAead, Hmac, V3Mode,
     },
     WildcardSNI,
 };
@@ -309,9 +309,9 @@ impl ShadowTlsServer {
             return Ok(());
         }
 
-        // stage 1.3.1: create per-frame HMAC with direction-separated keys
-        let mut frame_hmac_c2s = FrameHmac::new(&self.password, &server_random, b"c2s");
-        let frame_hmac_s2c = FrameHmac::new(&self.password, &server_random, b"s2c");
+        // stage 1.3.1: create per-frame AEAD with direction-separated keys
+        let mut frame_aead_c2s = FrameAead::new(&self.password, &server_random, b"c2s");
+        let frame_aead_s2c = FrameAead::new(&self.password, &server_random, b"s2c");
 
         // stage 1.3.2: copy ShadowTLS Client -> Handshake Server until hmac matches
         // stage 1.3.3: copy Handshake Server -> ShadowTLS Client verbatim (no modification)
@@ -327,10 +327,10 @@ impl ShadowTlsServer {
             let (mut stop_tx, mut stop_rx) = local_sync::oneshot::channel::<()>();
             let (maybe_pure, _) = monoio::join!(
                 async {
-                    let r = copy_by_frame_until_hmac_matches(
+                    let r = copy_by_frame_until_aead_matches(
                         &mut c_read,
                         &mut h_write,
-                        &mut frame_hmac_c2s,
+                        &mut frame_aead_c2s,
                     )
                     .await;
                     // Shutdown write to handshake server (TCP FIN). Handshake server
@@ -369,8 +369,8 @@ impl ShadowTlsServer {
         verified_relay(
             data_stream,
             unsafe { c_read.reunite(c_write).unwrap_unchecked() },
-            frame_hmac_s2c,
-            frame_hmac_c2s,
+            frame_aead_s2c,
+            frame_aead_c2s,
             !use_tls13,
             false, // server: already authenticated client via SessionID + first HMAC frame
         )
@@ -804,47 +804,49 @@ fn extract_server_random(frame: &[u8]) -> Option<[u8; TLS_RANDOM_SIZE]> {
     Some(server_random)
 }
 
-/// Copy frame by frame until an appdata frame matches HMAC.
-/// Return the matched pure data (without header).
+/// Copy frame by frame until an appdata frame is authenticated via AES-GCM.
+/// Return the decrypted pure data (without header).
 ///
-/// Uses FrameHmac: failed verifications do NOT corrupt state (seq unchanged).
+/// Uses FrameAead: failed verifications do NOT corrupt state (seq unchanged).
 ///
 /// Only used by V3 protocol.
-async fn copy_by_frame_until_hmac_matches(
+async fn copy_by_frame_until_aead_matches(
     mut read: impl AsyncReadRent,
     mut write: impl AsyncWriteRent,
-    hmac: &mut FrameHmac,
+    aead: &mut FrameAead,
 ) -> std::io::Result<Vec<u8>> {
     let mut g_buffer = Vec::new();
-    let mut hmac_matched = false;
+    let mut aead_matched = false;
 
     loop {
         let buffer = read_exact_frame_into(&mut read, g_buffer).await?;
         if buffer.len() > TLS_HMAC_HEADER_SIZE && buffer[0] == APPLICATION_DATA {
-            let header = &buffer[..TLS_HEADER_SIZE];
-            let payload = &buffer[TLS_HMAC_HEADER_SIZE..];
+            let header: [u8; TLS_HEADER_SIZE] =
+                buffer[..TLS_HEADER_SIZE].try_into().unwrap();
             let mut tag = [0u8; HMAC_SIZE];
             tag.copy_from_slice(&buffer[TLS_HEADER_SIZE..TLS_HMAC_HEADER_SIZE]);
 
-            if !hmac_matched {
-                hmac_matched = hmac.verify_and_advance(header, payload, &tag);
-            }
+            if !aead_matched {
+                // Decrypt in-place: copy ciphertext to mutable buffer
+                let mut payload = buffer[TLS_HMAC_HEADER_SIZE..].to_vec();
+                aead_matched = aead.decrypt_and_advance(&header, &mut payload, &tag);
 
-            if hmac_matched {
-                // Parse inner framing to extract actual user data (strip padding)
-                match crate::util::parse_inner_frame(payload) {
-                    Some((CMD_DATA, data)) if !data.is_empty() => {
-                        return Ok(data.to_vec());
-                    }
-                    Some((CMD_PADDING, _)) | Some((CMD_DATA, _)) => {
-                        g_buffer = buffer;
-                        continue;
-                    }
-                    _ => {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            "malformed inner frame in HMAC-matched packet",
-                        ));
+                if aead_matched {
+                    // Parse inner framing from decrypted plaintext
+                    match crate::util::parse_inner_frame(&payload) {
+                        Some((CMD_DATA, data)) if !data.is_empty() => {
+                            return Ok(data.to_vec());
+                        }
+                        Some((CMD_PADDING, _)) | Some((CMD_DATA, _)) => {
+                            g_buffer = buffer;
+                            continue;
+                        }
+                        _ => {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "malformed inner frame in AEAD-matched packet",
+                            ));
+                        }
                     }
                 }
             }

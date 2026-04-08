@@ -14,14 +14,14 @@ use monoio::{
 };
 use monoio_rustls_fork_shadow_tls::TlsConnector;
 use rand::{prelude::Distribution, seq::SliceRandom, Rng};
-use rustls_fork_shadow_tls::{OwnedTrustAnchor, RootCertStore, ServerName};
+use rustls_fork_shadow_tls::{OwnedTrustAnchor, RootCertStore, ServerName, SupportedCipherSuite};
 use serde::{de::Visitor, Deserialize};
 
 use crate::{
     helper_v2::{copy_with_application_data, copy_without_application_data, HashedReadStream},
     util::{
         bind_with_pretty_error, mod_tcp_conn, prelude::*, resolve, support_tls13,
-        verified_relay, FrameHmac, Hmac, V3Mode,
+        verified_relay, FrameAead, Hmac, V3Mode,
     },
 };
 
@@ -167,16 +167,48 @@ impl ShadowTlsClient {
                 ta.name_constraints.as_ref().map(|n| n.as_ref()),
             )
         }));
-        // TLS 1.2 and TLS 1.3 is enabled.
+        // Chrome-matching TLS fingerprint configuration.
+        // Cipher suites and key exchange groups ordered to match Chrome 131+.
+        // This is a protocol requirement (L3 fingerprint), not optional.
+        use rustls_fork_shadow_tls::cipher_suite::*;
+        use rustls_fork_shadow_tls::kx_group;
+
+        // Chrome cipher suite order: AES-128 before AES-256, ECDSA before RSA,
+        // CHACHA20 last (Chrome deprioritizes it on AES-NI capable hardware).
+        let chrome_cipher_suites: &[SupportedCipherSuite] = &[
+            // TLS 1.3
+            TLS13_AES_128_GCM_SHA256,
+            TLS13_AES_256_GCM_SHA384,
+            TLS13_CHACHA20_POLY1305_SHA256,
+            // TLS 1.2
+            TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+            TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+            TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+            TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+            TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+            TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+        ];
+
+        // Chrome key exchange group order: X25519, P-256, P-384
+        let chrome_kx_groups: &[&rustls_fork_shadow_tls::SupportedKxGroup] = &[
+            &kx_group::X25519,
+            &kx_group::SECP256R1,
+            &kx_group::SECP384R1,
+        ];
+
         let mut tls_config = rustls_fork_shadow_tls::ClientConfig::builder()
-            .with_safe_defaults()
+            .with_cipher_suites(chrome_cipher_suites)
+            .with_kx_groups(chrome_kx_groups)
+            .with_safe_default_protocol_versions()
+            .expect("TLS protocol version config failed")
             .with_root_certificates(root_store)
             .with_no_client_auth();
 
-        // Set tls config
-        if let Some(alpn) = tls_ext_config.alpn {
-            tls_config.alpn_protocols = alpn;
-        }
+        // Force browser-standard ALPN (protocol requirement, not optional).
+        tls_config.alpn_protocols = match tls_ext_config.alpn {
+            Some(alpn) if !alpn.is_empty() => alpn,
+            _ => vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+        };
 
         let tls_connector = TlsConnector::from(tls_config);
 
@@ -274,15 +306,15 @@ impl ShadowTlsClient {
         drop(session);
         let sr = maybe_sr.unwrap();
         tracing::debug!("Authorized, ServerRandom extracted: {sr:?}");
-        // Per-frame HMAC with direction-separated keys
-        let frame_hmac_c2s = FrameHmac::new(&self.password, &sr, b"c2s");
-        let frame_hmac_s2c = FrameHmac::new(&self.password, &sr, b"s2c");
+        // Per-frame AEAD with direction-separated keys
+        let frame_aead_c2s = FrameAead::new(&self.password, &sr, b"c2s");
+        let frame_aead_s2c = FrameAead::new(&self.password, &sr, b"s2c");
 
         verified_relay(
             in_stream,
             stream,
-            frame_hmac_c2s,
-            frame_hmac_s2c,
+            frame_aead_c2s,
+            frame_aead_s2c,
             !tls13,
             true, // client: auth_pending until first HMAC-verified server frame
         )
@@ -510,23 +542,38 @@ impl<S: AsyncReadRent> AsyncReadRent for StreamWrapper<S> {
     }
 }
 
-/// Doing fake request.
+/// Doing fake request with realistic browser headers.
+///
+/// Headers match a modern Chrome browser (131.x) to be consistent with
+/// the rustls TLS fingerprint (cipher suites, extensions, ALPN h2/http1.1).
 ///
 /// Only used by V3 protocol.
 async fn fake_request(
     mut stream: monoio_rustls_fork_shadow_tls::ClientTlsStream<TcpStream>,
 ) -> std::io::Result<()> {
-    const HEADER: &[u8; 207] = b"GET / HTTP/1.1\nUser-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/109.0.0.0 Safari/537.36\nAccept: gzip, deflate, br\nConnection: Close\nCookie: sessionid=";
+    const HEADER: &[u8] = b"GET / HTTP/1.1\r\n\
+Host: www.google.com\r\n\
+User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36\r\n\
+Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8\r\n\
+Accept-Language: en-US,en;q=0.9\r\n\
+Accept-Encoding: gzip, deflate, br, zstd\r\n\
+Connection: close\r\n\
+Sec-Fetch-Dest: document\r\n\
+Sec-Fetch-Mode: navigate\r\n\
+Sec-Fetch-Site: none\r\n\
+Sec-Fetch-User: ?1\r\n\
+Upgrade-Insecure-Requests: 1\r\n\
+Cookie: sessionid=";
     let cnt =
         rand::thread_rng().gen_range(FAKE_REQUEST_LENGTH_RANGE.0..FAKE_REQUEST_LENGTH_RANGE.1);
-    let mut buffer = Vec::with_capacity(cnt + HEADER.len() + 1);
+    let mut buffer = Vec::with_capacity(cnt + HEADER.len() + 4);
 
     buffer.extend_from_slice(HEADER);
     rand::distributions::Alphanumeric
         .sample_iter(rand::thread_rng())
         .take(cnt)
         .for_each(|c| buffer.push(c));
-    buffer.push(b'\n');
+    buffer.extend_from_slice(b"\r\n\r\n");
 
     let (res, mut buf) = stream.write_all(buffer).await;
     res?;
