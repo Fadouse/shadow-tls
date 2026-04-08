@@ -1,51 +1,37 @@
-use std::{
-    future::Future,
-    ptr::copy_nonoverlapping,
-    rc::Rc,
-    sync::Arc,
-};
+use std::rc::Rc;
+use std::sync::Arc;
 
 use anyhow::bail;
-use monoio::{
-    buf::IoBufMut,
-    io::{AsyncReadRent, AsyncReadRentExt, AsyncWriteRent, AsyncWriteRentExt, Splitable},
-    net::{TcpConnectOpts, TcpStream},
-    BufResult,
-};
-use monoio_rustls_fork_shadow_tls::TlsConnector;
-use rand::{prelude::Distribution, seq::SliceRandom, Rng};
-use rustls_fork_shadow_tls::{OwnedTrustAnchor, RootCertStore, ServerName, SupportedCipherSuite};
+use monoio::net::{TcpConnectOpts, TcpStream};
+use rand::seq::SliceRandom;
 use serde::{de::Visitor, Deserialize};
 
 use crate::{
-    helper_v2::{copy_with_application_data, copy_without_application_data, HashedReadStream},
+    boring_tls,
     util::{
-        bind_with_pretty_error, mod_tcp_conn, prelude::*, resolve, support_tls13,
-        verified_relay, FrameAead, Hmac, V3Mode,
+        bind_with_pretty_error, mod_tcp_conn, resolve, verified_relay, FrameAead,
+        V3Mode,
     },
 };
-
-const FAKE_REQUEST_LENGTH_RANGE: (usize, usize) = (16, 64);
 
 /// ShadowTlsClient.
 #[derive(Clone)]
 pub struct ShadowTlsClient {
     listen_addr: Arc<String>,
     target_addr: Arc<String>,
-    tls_connector: TlsConnector,
+    ssl_connector: Arc<boring::ssl::SslConnector>,
     tls_names: Arc<TlsNames>,
     password: Arc<String>,
     nodelay: bool,
     fastopen: bool,
-    v3: V3Mode,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct TlsNames(Vec<ServerName>);
+pub struct TlsNames(Vec<String>);
 
 impl TlsNames {
     #[inline]
-    pub fn random_choose(&self) -> &ServerName {
+    pub fn random_choose(&self) -> &str {
         self.0.choose(&mut rand::thread_rng()).unwrap()
     }
 }
@@ -54,14 +40,15 @@ impl TryFrom<&str> for TlsNames {
     type Error = anyhow::Error;
 
     fn try_from(value: &str) -> Result<Self, Self::Error> {
-        let v: Result<Vec<_>, _> = value.trim().split(';').map(ServerName::try_from).collect();
-        let v = v.map_err(Into::into).and_then(|v| {
-            if v.is_empty() {
-                Err(anyhow::anyhow!("empty tls names"))
-            } else {
-                Ok(v)
-            }
-        })?;
+        let v: Vec<String> = value
+            .trim()
+            .split(';')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if v.is_empty() {
+            return Err(anyhow::anyhow!("empty tls names"));
+        }
         Ok(Self(v))
     }
 }
@@ -157,70 +144,20 @@ impl ShadowTlsClient {
         password: String,
         nodelay: bool,
         fastopen: bool,
-        v3: V3Mode,
+        _v3: V3Mode,
     ) -> anyhow::Result<Self> {
-        let mut root_store = RootCertStore::empty();
-        root_store.add_server_trust_anchors(webpki_roots::TLS_SERVER_ROOTS.iter().map(|ta| {
-            OwnedTrustAnchor::from_subject_spki_name_constraints(
-                ta.subject.as_ref(),
-                ta.subject_public_key_info.as_ref(),
-                ta.name_constraints.as_ref().map(|n| n.as_ref()),
-            )
-        }));
-        // Chrome-matching TLS fingerprint configuration.
-        // Cipher suites and key exchange groups ordered to match Chrome 131+.
-        // This is a protocol requirement (L3 fingerprint), not optional.
-        use rustls_fork_shadow_tls::cipher_suite::*;
-        use rustls_fork_shadow_tls::kx_group;
-
-        // Chrome cipher suite order: AES-128 before AES-256, ECDSA before RSA,
-        // CHACHA20 last (Chrome deprioritizes it on AES-NI capable hardware).
-        let chrome_cipher_suites: &[SupportedCipherSuite] = &[
-            // TLS 1.3
-            TLS13_AES_128_GCM_SHA256,
-            TLS13_AES_256_GCM_SHA384,
-            TLS13_CHACHA20_POLY1305_SHA256,
-            // TLS 1.2
-            TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
-            TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-            TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
-            TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-            TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
-            TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
-        ];
-
-        // Chrome key exchange group order: X25519, P-256, P-384
-        let chrome_kx_groups: &[&rustls_fork_shadow_tls::SupportedKxGroup] = &[
-            &kx_group::X25519,
-            &kx_group::SECP256R1,
-            &kx_group::SECP384R1,
-        ];
-
-        let mut tls_config = rustls_fork_shadow_tls::ClientConfig::builder()
-            .with_cipher_suites(chrome_cipher_suites)
-            .with_kx_groups(chrome_kx_groups)
-            .with_safe_default_protocol_versions()
-            .expect("TLS protocol version config failed")
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
-
-        // Force browser-standard ALPN (protocol requirement, not optional).
-        tls_config.alpn_protocols = match tls_ext_config.alpn {
-            Some(alpn) if !alpn.is_empty() => alpn,
-            _ => vec![b"h2".to_vec(), b"http/1.1".to_vec()],
-        };
-
-        let tls_connector = TlsConnector::from(tls_config);
+        let alpn = tls_ext_config.alpn.unwrap_or_default();
+        let ssl_connector = boring_tls::build_chrome_ssl_connector(&alpn)
+            .map_err(|e| anyhow::anyhow!("Failed to build SSL connector: {e}"))?;
 
         Ok(Self {
             listen_addr: Arc::new(listen_addr),
             target_addr: Arc::new(target_addr),
-            tls_connector,
+            ssl_connector: Arc::new(ssl_connector),
             tls_names: Arc::new(tls_names),
             password: Arc::new(password),
             nodelay,
             fastopen,
-            v3,
         })
     }
 
@@ -235,10 +172,7 @@ impl ShadowTlsClient {
                     let client = shared.clone();
                     mod_tcp_conn(&mut conn, true, shared.nodelay);
                     monoio::spawn(async move {
-                        let _ = match client.v3.enabled() {
-                            false => client.relay_v2(conn).await,
-                            true => client.relay_v3(conn).await,
-                        };
+                        let _ = client.relay(conn).await;
                         tracing::info!("Relay for {addr} finished");
                     });
                 }
@@ -249,24 +183,8 @@ impl ShadowTlsClient {
         }
     }
 
-    /// Main relay for V2 protocol.
-    async fn relay_v2(&self, in_stream: TcpStream) -> anyhow::Result<()> {
-        let (out_stream, hash, session) = self.connect_v2().await?;
-        let mut hash_8b = [0; 8];
-        unsafe { std::ptr::copy_nonoverlapping(hash.as_ptr(), hash_8b.as_mut_ptr(), 8) };
-        let (out_r, mut out_w) = out_stream.into_split();
-        let (mut in_r, mut in_w) = in_stream.into_split();
-        let mut session_filtered_out_r = crate::helper_v2::SessionFilterStream::new(session, out_r);
-        let (a, b) = monoio::join!(
-            copy_without_application_data(&mut session_filtered_out_r, &mut in_w),
-            copy_with_application_data(&mut in_r, &mut out_w, Some(hash_8b))
-        );
-        let (_, _) = (a?, b?);
-        Ok(())
-    }
-
-    /// Main relay for V3 protocol.
-    async fn relay_v3(&self, in_stream: TcpStream) -> anyhow::Result<()> {
+    /// Main relay (V3 protocol).
+    async fn relay(&self, in_stream: TcpStream) -> anyhow::Result<()> {
         let addr = resolve(&self.target_addr).await?;
         let mut stream = TcpStream::connect_addr_with_config(
             addr,
@@ -276,39 +194,20 @@ impl ShadowTlsClient {
         mod_tcp_conn(&mut stream, true, self.nodelay);
         tracing::debug!("tcp connected, start handshaking");
 
-        // stage1: handshake with wrapper
-        let hamc_sr = Hmac::new(&self.password, (&[], &[]));
-        let stream = StreamWrapper::new(stream);
-        let sni = self.tls_names.random_choose().clone();
-        let tls_stream = self
-            .tls_connector
-            .connect_with_session_id_generator(sni, stream, move |data| {
-                generate_session_id(&hamc_sr, data)
-            })
-            .await?;
-        tracing::debug!("handshake success");
-        let (stream, session) = tls_stream.into_parts();
-        let authorized = stream.authorized();
-        let tls13 = stream.tls13;
-        let maybe_sr = stream.state().as_ref().map(|s| s.server_random);
-        let stream = stream.into_inner();
+        let sni = self.tls_names.random_choose();
+        let (server_random, tls13) =
+            boring_tls::perform_v3_handshake(&mut stream, &self.ssl_connector, sni, &self.password)
+                .await?;
 
-        // stage2:
-        if (maybe_sr.is_none() || !authorized) && self.v3.strict() {
-            tracing::warn!("V3 strict enabled: traffic hijacked or TLS1.3 is not supported");
-            let tls_stream = monoio_rustls_fork_shadow_tls::ClientTlsStream::new(stream, session);
-            if let Err(e) = fake_request(tls_stream).await {
-                bail!("traffic hijacked or TLS1.3 is not supported, fake request fail: {e}");
-            }
-            bail!("traffic hijacked or TLS1.3 is not supported, but fake request success");
+        if !tls13 {
+            tracing::warn!("TLS 1.3 is not supported by server, sending fake request");
+            boring_tls::perform_fake_request(&mut stream, &self.ssl_connector, sni).await?;
+            bail!("TLS 1.3 is not supported, fake request sent");
         }
 
-        drop(session);
-        let sr = maybe_sr.unwrap();
-        tracing::debug!("Authorized, ServerRandom extracted: {sr:?}");
-        // Per-frame AEAD with direction-separated keys
-        let frame_aead_c2s = FrameAead::new(&self.password, &sr, b"c2s");
-        let frame_aead_s2c = FrameAead::new(&self.password, &sr, b"s2c");
+        tracing::debug!("Authorized, ServerRandom extracted: {server_random:?}");
+        let frame_aead_c2s = FrameAead::new(&self.password, &server_random, b"c2s");
+        let frame_aead_s2c = FrameAead::new(&self.password, &server_random, b"s2c");
 
         verified_relay(
             in_stream,
@@ -316,305 +215,9 @@ impl ShadowTlsClient {
             frame_aead_c2s,
             frame_aead_s2c,
             !tls13,
-            true, // client: auth_pending until first HMAC-verified server frame
+            true,
         )
         .await;
         Ok(())
     }
-
-    /// Connect remote, do handshaking and calculate HMAC.
-    ///
-    /// Only used by V2 protocol.
-    async fn connect_v2(
-        &self,
-    ) -> anyhow::Result<(
-        TcpStream,
-        [u8; 20],
-        rustls_fork_shadow_tls::ClientConnection,
-    )> {
-        let addr = resolve(&self.target_addr).await?;
-        let mut stream = TcpStream::connect_addr_with_config(
-            addr,
-            &TcpConnectOpts::default().tcp_fast_open(self.fastopen),
-        )
-        .await?;
-        mod_tcp_conn(&mut stream, true, self.nodelay);
-        tracing::debug!("tcp connected, start handshaking");
-        let stream = HashedReadStream::new(stream, self.password.as_bytes())?;
-        let sni = self.tls_names.random_choose().clone();
-        let tls_stream = self.tls_connector.connect(sni, stream).await?;
-        let (io, session) = tls_stream.into_parts();
-        let hash = io.hash();
-        tracing::debug!("tls handshake finished, signed hmac: {:?}", hash);
-        let stream = io.into_inner();
-        Ok((stream, hash, session))
-    }
-}
-
-/// A wrapper for doing data extraction and modification.
-///
-/// Only used by V3 protocol.
-struct StreamWrapper<S> {
-    raw: S,
-
-    read_buf: Option<Vec<u8>>,
-    read_pos: usize,
-
-    read_state: Option<State>,
-    read_authorized: bool,
-    tls13: bool,
-}
-
-#[derive(Clone)]
-struct State {
-    server_random: [u8; TLS_RANDOM_SIZE],
-}
-
-impl<S> StreamWrapper<S> {
-    fn new(raw: S) -> Self {
-        Self {
-            raw,
-
-            read_buf: Some(Vec::new()),
-            read_pos: 0,
-
-            read_state: None,
-            read_authorized: false,
-            tls13: false,
-        }
-    }
-
-    fn authorized(&self) -> bool {
-        self.read_authorized
-    }
-
-    fn state(&self) -> &Option<State> {
-        &self.read_state
-    }
-
-    fn into_inner(self) -> S {
-        self.raw
-    }
-}
-
-impl<S: AsyncReadRent> StreamWrapper<S> {
-    async fn feed_data(&mut self) -> std::io::Result<usize> {
-        let mut buf = self.read_buf.take().unwrap();
-
-        // read header
-        unsafe { buf.set_init(0) };
-        self.read_pos = 0;
-        buf.reserve(TLS_HEADER_SIZE);
-        let (res, buf) = self.raw.read_exact(buf.slice_mut(0..TLS_HEADER_SIZE)).await;
-        match res {
-            Ok(_) => (),
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                tracing::debug!("stream wrapper eof");
-                self.read_buf = Some(buf.into_inner());
-                return Ok(0);
-            }
-            Err(e) => {
-                tracing::error!("stream wrapper unable to read tls header: {e}");
-                self.read_buf = Some(buf.into_inner());
-                return Err(e);
-            }
-        }
-        let mut buf: Vec<u8> = buf.into_inner();
-        let mut size: [u8; 2] = Default::default();
-        size.copy_from_slice(&buf[3..5]);
-        let data_size = u16::from_be_bytes(size) as usize;
-
-        // read body
-        buf.reserve(data_size);
-        let (res, buf) = self
-            .raw
-            .read_exact(buf.slice_mut(TLS_HEADER_SIZE..TLS_HEADER_SIZE + data_size))
-            .await;
-        if let Err(e) = res {
-            self.read_buf = Some(buf.into_inner());
-            return Err(e);
-        }
-        let buf: Vec<u8> = buf.into_inner();
-
-        // do extraction
-        match buf[0] {
-            HANDSHAKE => {
-                if buf.len() > SERVER_RANDOM_IDX + TLS_RANDOM_SIZE && buf[5] == SERVER_HELLO {
-                    // we can read server random
-                    let mut server_random = [0; TLS_RANDOM_SIZE];
-                    unsafe {
-                        copy_nonoverlapping(
-                            buf.as_ptr().add(SERVER_RANDOM_IDX),
-                            server_random.as_mut_ptr(),
-                            TLS_RANDOM_SIZE,
-                        )
-                    }
-                    tracing::debug!("ServerRandom extracted: {server_random:?}");
-                    self.read_state = Some(State {
-                        server_random,
-                    });
-                    self.tls13 = support_tls13(&buf);
-                }
-            }
-            APPLICATION_DATA => {
-                // Handshake frames are relayed verbatim (no XOR/HMAC modification)
-                // to avoid detectable frame length changes (anti-aparecium).
-                // Authorization is based on successful ServerRandom extraction.
-                self.read_authorized = self.read_state.is_some();
-            }
-            _ => {}
-        }
-
-        // set buffer
-        let buf_len = buf.len();
-        self.read_buf = Some(buf);
-        Ok(buf_len)
-    }
-}
-
-impl<S: AsyncWriteRent> AsyncWriteRent for StreamWrapper<S> {
-    #[inline]
-    fn write<T: monoio::buf::IoBuf>(
-        &mut self,
-        buf: T,
-    ) -> impl Future<Output = BufResult<usize, T>> {
-        self.raw.write(buf)
-    }
-    #[inline]
-    fn writev<T: monoio::buf::IoVecBuf>(
-        &mut self,
-        buf_vec: T,
-    ) -> impl Future<Output = BufResult<usize, T>> {
-        self.raw.writev(buf_vec)
-    }
-    #[inline]
-    fn flush(&mut self) -> impl Future<Output = std::io::Result<()>> {
-        self.raw.flush()
-    }
-    #[inline]
-    fn shutdown(&mut self) -> impl Future<Output = std::io::Result<()>> {
-        self.raw.shutdown()
-    }
-}
-
-impl<S: AsyncReadRent> AsyncReadRent for StreamWrapper<S> {
-    // uncancelable
-    async fn read<T: monoio::buf::IoBufMut>(&mut self, mut buf: T) -> BufResult<usize, T> {
-        loop {
-            let owned_buf = self.read_buf.as_mut().unwrap();
-            let data_len = owned_buf.len() - self.read_pos;
-            // there is enough data to copy
-            if data_len > 0 {
-                let to_copy = buf.bytes_total().min(data_len);
-                unsafe {
-                    copy_nonoverlapping(
-                        owned_buf.as_ptr().add(self.read_pos),
-                        buf.write_ptr(),
-                        to_copy,
-                    );
-                    buf.set_init(to_copy);
-                };
-                self.read_pos += to_copy;
-                return (Ok(to_copy), buf);
-            }
-
-            // no data now
-            match self.feed_data().await {
-                Ok(0) => return (Ok(0), buf),
-                Ok(_) => continue,
-                Err(e) => return (Err(e), buf),
-            }
-        }
-    }
-
-    async fn readv<T: monoio::buf::IoVecBufMut>(&mut self, mut buf: T) -> BufResult<usize, T> {
-        let slice = match monoio::buf::IoVecWrapperMut::new(buf) {
-            Ok(slice) => slice,
-            Err(buf) => return (Ok(0), buf),
-        };
-
-        let (result, slice) = self.read(slice).await;
-        buf = slice.into_inner();
-        if let Ok(n) = result {
-            unsafe { buf.set_init(n) };
-        }
-        (result, buf)
-    }
-}
-
-/// Doing fake request with realistic browser headers.
-///
-/// Headers match a modern Chrome browser (131.x) to be consistent with
-/// the rustls TLS fingerprint (cipher suites, extensions, ALPN h2/http1.1).
-///
-/// Only used by V3 protocol.
-async fn fake_request(
-    mut stream: monoio_rustls_fork_shadow_tls::ClientTlsStream<TcpStream>,
-) -> std::io::Result<()> {
-    const HEADER: &[u8] = b"GET / HTTP/1.1\r\n\
-Host: www.google.com\r\n\
-User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36\r\n\
-Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8\r\n\
-Accept-Language: en-US,en;q=0.9\r\n\
-Accept-Encoding: gzip, deflate, br, zstd\r\n\
-Connection: close\r\n\
-Sec-Fetch-Dest: document\r\n\
-Sec-Fetch-Mode: navigate\r\n\
-Sec-Fetch-Site: none\r\n\
-Sec-Fetch-User: ?1\r\n\
-Upgrade-Insecure-Requests: 1\r\n\
-Cookie: sessionid=";
-    let cnt =
-        rand::thread_rng().gen_range(FAKE_REQUEST_LENGTH_RANGE.0..FAKE_REQUEST_LENGTH_RANGE.1);
-    let mut buffer = Vec::with_capacity(cnt + HEADER.len() + 4);
-
-    buffer.extend_from_slice(HEADER);
-    rand::distributions::Alphanumeric
-        .sample_iter(rand::thread_rng())
-        .take(cnt)
-        .for_each(|c| buffer.push(c));
-    buffer.extend_from_slice(b"\r\n\r\n");
-
-    let (res, mut buf) = stream.write_all(buffer).await;
-    res?;
-    let _ = stream.shutdown().await;
-
-    // read until eof
-    loop {
-        let (res, b) = stream.read(buf).await;
-        buf = b;
-        if res? == 0 {
-            return Ok(());
-        }
-    }
-}
-
-/// Take a slice of tls frame[5..] and returns signed session id.
-///
-/// Only used by V3 protocol.
-fn generate_session_id(hmac: &Hmac, buf: &[u8]) -> [u8; TLS_SESSION_ID_SIZE] {
-    /// Note: SESSION_ID_START does not include 5 TLS_HEADER_SIZE.
-    const SESSION_ID_START: usize = 1 + 3 + 2 + TLS_RANDOM_SIZE + 1;
-
-    if buf.len() < SESSION_ID_START + TLS_SESSION_ID_SIZE {
-        tracing::warn!("unexpected client hello length");
-        return [0; TLS_SESSION_ID_SIZE];
-    }
-
-    let mut session_id = [0; TLS_SESSION_ID_SIZE];
-    rand::thread_rng().fill(&mut session_id[..TLS_SESSION_ID_SIZE - SESSION_HMAC_SIZE]);
-    let mut hmac = hmac.to_owned();
-    hmac.update(&buf[0..SESSION_ID_START]);
-    hmac.update(&session_id);
-    hmac.update(&buf[SESSION_ID_START + TLS_SESSION_ID_SIZE..]);
-    let hmac_val = hmac.finalize();
-    unsafe {
-        copy_nonoverlapping(
-            hmac_val.as_ptr(),
-            session_id.as_mut_ptr().add(TLS_SESSION_ID_SIZE - SESSION_HMAC_SIZE),
-            SESSION_HMAC_SIZE,
-        )
-    }
-    tracing::debug!("ClientHello before sign: {buf:?}, session_id {session_id:?}");
-    session_id
 }

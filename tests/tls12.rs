@@ -6,33 +6,6 @@ use utils::*;
 
 // handshake: badssl.com(tls1.2 only)
 // data: captive.apple.com:80
-// protocol: v2
-#[test]
-fn tls12_v2() {
-    let client = RunningArgs::Client {
-        listen_addr: "127.0.0.1:30000".to_string(),
-        target_addr: "127.0.0.1:30001".to_string(),
-        tls_names: TlsNames::try_from("badssl.com").unwrap(),
-        tls_ext: TlsExtConfig::new(None),
-        password: "test".to_string(),
-        nodelay: true,
-        fastopen: true,
-        v3: V3Mode::Disabled,
-    };
-    let server = RunningArgs::Server {
-        listen_addr: "127.0.0.1:30001".to_string(),
-        target_addr: "captive.apple.com:80".to_string(),
-        tls_addr: TlsAddrs::try_from("badssl.com").unwrap(),
-        password: "test".to_string(),
-        nodelay: true,
-        fastopen: true,
-        v3: V3Mode::Disabled,
-    };
-    test_ok(client, server, CAPTIVE_HTTP_REQUEST, CAPTIVE_HTTP_RESP);
-}
-
-// handshake: badssl.com(tls1.2 only)
-// data: captive.apple.com:80
 // protocol: v3 lossy
 #[test]
 fn tls12_v3_lossy() {
@@ -55,13 +28,12 @@ fn tls12_v3_lossy() {
         fastopen: true,
         v3: V3Mode::Lossy,
     };
-    utils::test_ok(client, server, CAPTIVE_HTTP_REQUEST, CAPTIVE_HTTP_RESP);
+    test_ok(client, server, CAPTIVE_HTTP_REQUEST, CAPTIVE_HTTP_RESP);
 }
 
 // handshake: badssl.com(tls1.2 only)
 // data: captive.apple.com:80
-// protocol: v3 strict
-// v3 strict cannot work with tls1.2, so it must fail
+// protocol: v3 strict(must panic since server only supports tls1.2)
 #[test]
 #[should_panic]
 fn tls12_v3_strict() {
@@ -84,18 +56,14 @@ fn tls12_v3_strict() {
         fastopen: true,
         v3: V3Mode::Strict,
     };
-    utils::test_ok(client, server, CAPTIVE_HTTP_REQUEST, CAPTIVE_HTTP_RESP);
+    test_ok(client, server, CAPTIVE_HTTP_REQUEST, CAPTIVE_HTTP_RESP);
 }
 
 // handshake: badssl.com(tls1.2 only)
-// data: badssl.com:443
-// protocol: v2
-// Note: v2 can not defend against hijack attack.
-// Here hijack means directly connect to the handshake server.
-// The interceptor will see TLS Alert.
-// But it will not cause data error since the connection will be closed.
+// protocol: v3 lossy
+// tls1.2 with v3 protocol does NOT defend against hijack attack(lossy).
 #[test]
-fn tls12_v2_hijack() {
+fn tls12_v3_lossy_hijack() {
     let client = RunningArgs::Client {
         listen_addr: "127.0.0.1:30006".to_string(),
         target_addr: "badssl.com:443".to_string(),
@@ -104,21 +72,17 @@ fn tls12_v2_hijack() {
         password: "test".to_string(),
         nodelay: true,
         fastopen: true,
-        v3: V3Mode::Disabled,
+        v3: V3Mode::Lossy,
     };
     test_hijack(client);
 }
 
-// handshake: badssl.com(tls1.2 only)
-// data: captive.apple.com:80
-// protocol: v3 lossy
-// (v3 strict can not work with tls1.2)
-// Note: tls1.2 with v3 lossy can not defend against hijack attack.
-// Here hijack means directly connect to the handshake server.
-// The interceptor will see TLS Alert.
-// But it will not cause data error since the connection will be closed.
+// badssl.com(tls1.2 only)
+// protocol: v3 strict
+// tls1.2 with v3 protocol does NOT defend against hijack attack(strict).
+// BUT: it does reject the hijacked data, making it fail.
 #[test]
-fn tls12_v3_lossy_hijack() {
+fn tls12_v2_hijack() {
     let client = RunningArgs::Client {
         listen_addr: "127.0.0.1:30007".to_string(),
         target_addr: "badssl.com:443".to_string(),
@@ -127,7 +91,7 @@ fn tls12_v3_lossy_hijack() {
         password: "test".to_string(),
         nodelay: true,
         fastopen: true,
-        v3: V3Mode::Lossy,
+        v3: V3Mode::Strict,
     };
     test_hijack(client);
 }

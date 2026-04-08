@@ -37,13 +37,11 @@ pub(crate) mod prelude {
     pub(crate) const ALERT: u8 = 0x15;
     pub(crate) const HANDSHAKE: u8 = 0x16;
     pub(crate) const APPLICATION_DATA: u8 = 0x17;
-    pub(crate) const CHANGE_CIPHER_SPEC: u8 = 0x14;
 
     pub(crate) const SERVER_RANDOM_IDX: usize = TLS_HEADER_SIZE + 1 + 3 + 2;
     pub(crate) const SESSION_ID_LEN_IDX: usize = TLS_HEADER_SIZE + 1 + 3 + 2 + TLS_RANDOM_SIZE;
     pub(crate) const TLS_HMAC_HEADER_SIZE: usize = TLS_HEADER_SIZE + HMAC_SIZE;
 
-    pub(crate) const COPY_BUF_SIZE: usize = 4096;
     /// V3 per-frame HMAC tag size (16 bytes = HMAC-SHA256 truncated to 128 bits).
     pub(crate) const HMAC_SIZE: usize = 16;
     /// V3 SessionID HMAC size (4 bytes, used for ClientHello authentication).
@@ -180,10 +178,6 @@ impl Hmac {
         res
     }
 
-    #[inline]
-    pub(crate) fn to_owned(&self) -> Self {
-        Self(self.0.clone())
-    }
 }
 
 /// Per-frame AEAD with AES-128-GCM, independent sequence numbers, and direction-separated keys.

@@ -149,14 +149,18 @@ After the initial 8 packets, each frame has a **2% probability** of receiving 0�
 
 ## TLS Fingerprint Requirements
 
-The client **MUST** produce a TLS ClientHello that closely matches a modern browser (Chrome 131+). This is a protocol requirement, not optional:
+The client **MUST** produce a TLS ClientHello identical to a real Chrome browser. This implementation uses **BoringSSL** (Chrome's actual TLS library) via the `boring` crate, which guarantees an authentic fingerprint rather than a simulation:
 
-- **Cipher suites**: Chrome order (GREASE + AES-128-GCM first, CHACHA20 last, SCSV at end)
-- **Key exchange groups**: X25519, P-256, P-384
+- **TLS library**: BoringSSL (the same library used by Chrome, Android, and Cloudflare)
+- **GREASE**: Native BoringSSL GREASE (RFC 8701) — identical distribution to Chrome
+- **Cipher suites**: Chrome order (TLS 1.3: AES-128-GCM, AES-256-GCM, CHACHA20; TLS 1.2: ECDHE-ECDSA/RSA with AES-128/256-GCM and CHACHA20)
+- **Key exchange groups**: X25519Kyber768Draft00 (post-quantum), X25519, P-256, P-384 — the ~1200-byte Kyber key share is critical; without it, ClientHello is ~1000 bytes shorter than real Chrome
 - **ALPN**: `h2`, `http/1.1` (mandatory)
-- **Extensions**: Chrome-order with GREASE extensions (RFC 8701), `compress_certificate` (brotli), `renegotiation_info`, and `padding` (align to 512 bytes)
-- **Signature algorithms**: Chrome order (ecdsa_p256_sha256, rsa_pss_sha256, rsa_pkcs1_sha256, ecdsa_p384_sha384, rsa_pss_sha384, rsa_pkcs1_sha384, rsa_pss_sha512, rsa_pkcs1_sha512)
-- **Supported versions**: GREASE version + TLS 1.3 + TLS 1.2
+- **Extensions**: Native BoringSSL extension ordering, certificate compression, and all Chrome-standard extensions
+- **Signature algorithms**: Chrome order (ECDSA+SHA256, RSA-PSS+SHA256, RSA+SHA256, ECDSA+SHA384, RSA-PSS+SHA384, RSA+SHA384, RSA-PSS+SHA512, RSA+SHA512)
+- **Supported versions**: TLS 1.2, TLS 1.3
+
+Since BoringSSL IS Chrome's TLS stack, JA3/JA4 fingerprints, extension order, key share sizes, and all internal encoding details are identical to real Chrome — not simulated.
 
 ## Muddling Request
 

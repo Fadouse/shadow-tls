@@ -148,14 +148,18 @@ ciphertext || tag = AES-128-GCM(key, nonce, AAD=tls_header, plaintext=inner_payl
 
 ## TLS 指纹要求
 
-客户端**必须**产生与现代浏览器（Chrome 131+）高度匹配的 TLS ClientHello。这是协议要求，不可选：
+客户端**必须**产生与真实 Chrome 浏览器完全一致的 TLS ClientHello。本实现使用 **BoringSSL**（Chrome 的实际 TLS 库），通过 `boring` crate 接入，保证指纹是原生的而非模拟的：
 
-- **密码套件**：Chrome 顺序（GREASE + AES-128-GCM 优先，CHACHA20 在后，SCSV 在末尾）
-- **密钥交换组**：X25519、P-256、P-384
+- **TLS 库**：BoringSSL（Chrome、Android、Cloudflare 使用的同一 TLS 库）
+- **GREASE**：原生 BoringSSL GREASE（RFC 8701）——分布与 Chrome 完全一致
+- **密码套件**：Chrome 顺序（TLS 1.3：AES-128-GCM、AES-256-GCM、CHACHA20；TLS 1.2：ECDHE-ECDSA/RSA 配合 AES-128/256-GCM 和 CHACHA20）
+- **密钥交换组**：X25519Kyber768Draft00（后量子）、X25519、P-256、P-384——约 1200 字节的 Kyber 密钥份额是关键信号；缺少它，ClientHello 比真实 Chrome 短约 1000 字节
 - **ALPN**：`h2`、`http/1.1`（强制）
-- **扩展**：Chrome 顺序，包含 GREASE 扩展（RFC 8701）、`compress_certificate`（brotli）、`renegotiation_info`、`padding`（对齐至 512 字节）
-- **签名算法**：Chrome 顺序（ecdsa_p256_sha256、rsa_pss_sha256、rsa_pkcs1_sha256、ecdsa_p384_sha384、rsa_pss_sha384、rsa_pkcs1_sha384、rsa_pss_sha512、rsa_pkcs1_sha512）
-- **支持版本**：GREASE 版本 + TLS 1.3 + TLS 1.2
+- **扩展**：原生 BoringSSL 扩展顺序、证书压缩及所有 Chrome 标准扩展
+- **签名算法**：Chrome 顺序（ECDSA+SHA256、RSA-PSS+SHA256、RSA+SHA256、ECDSA+SHA384、RSA-PSS+SHA384、RSA+SHA384、RSA-PSS+SHA512、RSA+SHA512）
+- **支持版本**：TLS 1.2、TLS 1.3
+
+由于 BoringSSL 就是 Chrome 的 TLS 栈，JA3/JA4 指纹、扩展顺序、密钥份额大小及所有内部编码细节均与真实 Chrome 一致，而非模拟。
 
 ## 糊弄性请求（Muddling Request）
 

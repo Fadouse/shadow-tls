@@ -1,6 +1,5 @@
 use std::{
     borrow::Cow,
-    collections::VecDeque,
     ptr::copy_nonoverlapping,
     rc::Rc,
     sync::Arc,
@@ -10,9 +9,9 @@ use anyhow::bail;
 use byteorder::{BigEndian, ReadBytesExt};
 use local_sync::oneshot::Sender;
 use monoio::{
-    buf::{IoBuf, IoBufMut, Slice, SliceMut},
+    buf::IoBufMut,
     io::{
-        AsyncReadRent, AsyncReadRentExt, AsyncWriteRent, AsyncWriteRentExt, PrefixedReadIo,
+        AsyncReadRent, AsyncReadRentExt, AsyncWriteRent, AsyncWriteRentExt,
         Splitable,
     },
     net::TcpStream,
@@ -20,12 +19,8 @@ use monoio::{
 use serde::Deserialize;
 
 use crate::{
-    helper_v2::{
-        copy_with_application_data, copy_without_application_data, ErrGroup, FirstRetGroup,
-        FutureOrOutput, HashedWriteStream, HmacHandler, HMAC_SIZE_V2,
-    },
     util::{
-        bind_with_pretty_error, copy_bidirectional, copy_until_eof, mod_tcp_conn, prelude::*,
+        bind_with_pretty_error, copy_bidirectional, mod_tcp_conn, prelude::*,
         resolve, support_tls13, verified_relay, CursorExt, FrameAead, Hmac, V3Mode,
     },
     WildcardSNI,
@@ -63,10 +58,6 @@ impl TlsAddrs {
             },
             None => Cow::Borrowed(&self.fallback),
         }
-    }
-
-    fn is_empty(&self) -> bool {
-        self.dispatch.is_empty()
     }
 
     pub fn set_wildcard_sni(&mut self, wildcard_sni: WildcardSNI) {
@@ -170,10 +161,7 @@ impl ShadowTlsServer {
                     let server = shared.clone();
                     mod_tcp_conn(&mut conn, true, shared.nodelay);
                     monoio::spawn(async move {
-                        let _ = match server.v3.enabled() {
-                            false => server.relay_v2(conn).await,
-                            true => server.relay_v3(conn).await,
-                        };
+                        let _ = server.relay(conn).await;
                         tracing::info!("Relay for {addr} finished");
                     });
                 }
@@ -184,81 +172,8 @@ impl ShadowTlsServer {
         }
     }
 
-    /// Main relay for V2 protocol.
-    async fn relay_v2(&self, in_stream: TcpStream) -> anyhow::Result<()> {
-        // wrap in_stream with hash layer
-        let mut in_stream = HashedWriteStream::new(in_stream, self.password.as_bytes())?;
-        let mut hmac = in_stream.hmac_handler();
-
-        // read and extract server name
-        // if there is only one fallback server, skip it
-        let (prefix, server_name) = match self.tls_addr.is_empty() {
-            true => (Vec::new(), None),
-            false => extract_sni_v2(&mut in_stream).await?,
-        };
-        let prefixed_io = PrefixedReadIo::new(&mut in_stream, std::io::Cursor::new(prefix));
-        tracing::debug!("server name extracted from SNI extention: {server_name:?}");
-
-        // choose handshake server addr and connect
-        let server_name = server_name.and_then(|s| String::from_utf8(s).ok());
-        let addr = resolve(
-            &self
-                .tls_addr
-                .find(server_name.as_ref().map(AsRef::as_ref), true),
-        )
-        .await?;
-        let mut out_stream = TcpStream::connect_addr(addr).await?;
-        mod_tcp_conn(&mut out_stream, true, self.nodelay);
-        tracing::debug!("handshake server connected: {addr}");
-
-        // copy stage 1
-        let (mut out_r, mut out_w) = out_stream.into_split();
-        let (mut in_r, mut in_w) = prefixed_io.into_split();
-        let (switch, cp) = FirstRetGroup::new(
-            copy_until_handshake_finished(&mut in_r, &mut out_w, &hmac),
-            Box::pin(copy_until_eof(&mut out_r, &mut in_w)),
-        )
-        .await?;
-        hmac.disable();
-        tracing::debug!("handshake finished, switch: {switch:?}");
-
-        // copy stage 2
-        match switch {
-            SwitchResult::Switch(data_left) => {
-                drop(cp);
-                let in_stream = unsafe { in_r.reunite(in_w).unwrap_unchecked() };
-                let in_stream = in_stream.into_inner();
-                let (mut in_r, mut in_w) = in_stream.into_split();
-
-                // connect our data server
-                let _ = out_r.reunite(out_w).unwrap().shutdown().await;
-                let mut data_stream =
-                    TcpStream::connect_addr(resolve(&self.target_addr).await?).await?;
-                mod_tcp_conn(&mut data_stream, true, self.nodelay);
-                tracing::debug!("data server connected, start relay");
-                let (mut data_r, mut data_w) = data_stream.into_split();
-                let (result, _) = data_w.write(data_left).await;
-                result?;
-                ErrGroup::new(
-                    copy_with_application_data::<0, _, _>(&mut data_r, &mut in_w, None),
-                    copy_without_application_data(&mut in_r, &mut data_w),
-                )
-                .await?;
-            }
-            SwitchResult::DirectProxy => match cp {
-                FutureOrOutput::Future(cp) => {
-                    ErrGroup::new(cp, copy_until_eof(in_r, out_w)).await?;
-                }
-                FutureOrOutput::Output(_) => {
-                    copy_until_eof(in_r, out_w).await?;
-                }
-            },
-        }
-        Ok(())
-    }
-
-    /// Main relay for V3 protocol.
-    async fn relay_v3(&self, mut in_stream: TcpStream) -> anyhow::Result<()> {
+    /// Main relay (V3 protocol).
+    async fn relay(&self, mut in_stream: TcpStream) -> anyhow::Result<()> {
         // stage 1.1: read and validate client hello
         let first_client_frame = read_exact_frame(&mut in_stream).await?;
         let (client_hello_pass, sni) = verified_extract_sni(&first_client_frame, &self.password);
@@ -379,306 +294,6 @@ impl ShadowTlsServer {
     }
 }
 
-/// A helper struct for doing source switching.
-///
-/// Only used by V2 protocol.
-enum SwitchResult {
-    Switch(Vec<u8>),
-    DirectProxy,
-}
-
-impl std::fmt::Debug for SwitchResult {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Switch(_) => write!(f, "Switch"),
-            Self::DirectProxy => write!(f, "DirectProxy"),
-        }
-    }
-}
-
-/// Copy until handshake finished.
-/// We use HMAC to check if handshake finished.
-///
-/// Only used by V2 protocol.
-async fn copy_until_handshake_finished<R, W>(
-    mut read_half: R,
-    mut write_half: W,
-    hmac: &HmacHandler,
-) -> std::io::Result<SwitchResult>
-where
-    R: AsyncReadRent,
-    W: AsyncWriteRent,
-{
-    // We maintain 2 state to make sure current session is in an tls session.
-    // This is essential for preventing active detection.
-    let mut has_seen_change_cipher_spec = false;
-    let mut has_seen_handshake = false;
-
-    // header_buf is used to read handshake frame header, will be a fixed size buffer.
-    let mut header_buf = vec![0_u8; TLS_HEADER_SIZE].into_boxed_slice();
-    let mut header_read_len = 0;
-    let mut header_write_len = 0;
-    // data_buf is used to read and write data, and can be expanded.
-    let mut data_hmac_buf = vec![0_u8; HMAC_SIZE_V2].into_boxed_slice();
-    let mut data_buf = vec![0_u8; 2048];
-    let mut application_data_count: usize = 0;
-
-    let mut hashes = VecDeque::with_capacity(10);
-    loop {
-        let header_buf_slice = SliceMut::new(header_buf, header_read_len, TLS_HEADER_SIZE);
-        let (res, header_buf_slice_) = read_half.read(header_buf_slice).await;
-        header_buf = header_buf_slice_.into_inner();
-        let read_len = res?;
-        header_read_len += read_len;
-
-        // If EOF, close write half.
-        if read_len == 0 {
-            let _ = write_half.shutdown().await;
-            return Err(std::io::ErrorKind::UnexpectedEof.into());
-        }
-
-        // We have to relay data now no matter header is enough or not.
-        let header_buf_slice_w = Slice::new(header_buf, header_write_len, header_read_len);
-        let (res, header_buf_slice_w_) = write_half.write_all(header_buf_slice_w).await;
-        header_buf = header_buf_slice_w_.into_inner();
-        header_write_len += res?;
-
-        if header_read_len != TLS_HEADER_SIZE {
-            // Here we have not got enough data to parse header.
-            // continue to read.
-            continue;
-        }
-
-        // Now header has been read and redirected successfully.
-        // We should clear header status.
-        header_read_len = 0;
-        header_write_len = 0;
-
-        // Parse length.
-        let mut size: [u8; 2] = Default::default();
-        size.copy_from_slice(&header_buf[3..5]);
-        let data_size = u16::from_be_bytes(size) as usize;
-        tracing::debug!(
-            "read header with type {} and length {}",
-            header_buf[0],
-            data_size
-        );
-
-        // Check data type, if not app data we want, we can forward it directly(in streaming way).
-        if header_buf[0] != APPLICATION_DATA
-            || !has_seen_handshake
-            || !has_seen_change_cipher_spec
-            || data_size < HMAC_SIZE_V2
-        {
-            // The first packet must be handshake.
-            // Also, every packet's version must be valid.
-            let valid = (has_seen_handshake || header_buf[0] == HANDSHAKE)
-                && header_buf[1] == TLS_MAJOR
-                && (header_buf[2] == TLS_MINOR.0 || header_buf[2] == TLS_MINOR.1);
-            if header_buf[0] == CHANGE_CIPHER_SPEC {
-                has_seen_change_cipher_spec = true;
-            }
-            if header_buf[0] == HANDSHAKE {
-                has_seen_handshake = true;
-            }
-            // Copy data.
-            let mut to_copy = data_size;
-            while to_copy != 0 {
-                let max_read = data_buf.capacity().min(to_copy);
-                let buf = SliceMut::new(data_buf, 0, max_read);
-                let (read_res, buf) = read_half.read(buf).await;
-
-                // if EOF, close write half.
-                let read_len = read_res?;
-                if read_len == 0 {
-                    let _ = write_half.shutdown().await;
-                    return Err(std::io::ErrorKind::UnexpectedEof.into());
-                }
-
-                let buf = buf.into_inner().slice(0..read_len);
-                let (write_res, buf) = write_half.write_all(buf).await;
-                to_copy -= write_res?;
-                data_buf = buf.into_inner();
-            }
-            tracing::debug!("copied data with length {:?}", data_size);
-            if !valid {
-                tracing::debug!("early invalid tls: header {:?}", &header_buf[..3]);
-                return Ok(SwitchResult::DirectProxy);
-            }
-            continue;
-        }
-
-        // Here we need to check hmac.
-        // We have to read and copy the maybe_hmac.
-        // Note: Send this 8 byte to remote does not matters:
-        // If the data is sent by our authorized client, the handshake server must within
-        // a tls session. So it must read exact that length data and then process it.
-        // For this reason, sending 8 byte hmac will not cause the handshake server
-        // shuting down the connection.
-        // If the data in sent by an attacker, we must behaves like a tcp proxy so it seems
-        // we are the handshake server.
-        let mut hmac_read_len = 0;
-        while hmac_read_len < HMAC_SIZE_V2 {
-            let buf = SliceMut::new(data_hmac_buf, hmac_read_len, HMAC_SIZE_V2);
-            let (res, buf_) = read_half.read(buf).await;
-            // if EOF, close write half.
-            let read_len = res?;
-            if read_len == 0 {
-                let _ = write_half.shutdown().await;
-                return Err(std::io::ErrorKind::UnexpectedEof.into());
-            }
-
-            let buf = Slice::new(buf_.into_inner(), hmac_read_len, hmac_read_len + read_len);
-            let (write_res, buf_) = write_half.write_all(buf).await;
-            write_res?;
-            hmac_read_len += read_len;
-            data_hmac_buf = buf_.into_inner();
-        }
-
-        // Now hmac has been read and copied.
-        // If hmac matches, we need to read current data and return.
-        let hash = hmac.hash();
-        let mut hash_trim = [0; HMAC_SIZE_V2];
-        unsafe { copy_nonoverlapping(hash.as_ptr(), hash_trim.as_mut_ptr(), HMAC_SIZE_V2) };
-        tracing::debug!("hmac calculated: {hash_trim:?}");
-        if hashes.len() + 1 > hashes.capacity() {
-            hashes.pop_front();
-        }
-        hashes.push_back(hash_trim);
-        unsafe {
-            copy_nonoverlapping(data_hmac_buf.as_ptr(), hash_trim.as_mut_ptr(), HMAC_SIZE_V2)
-        };
-        if hashes.contains(&hash_trim) {
-            tracing::debug!("hmac matches");
-            let pure_data = vec![0; data_size - HMAC_SIZE_V2];
-            let (read_res, pure_data) = read_half.read_exact(pure_data).await;
-            read_res?;
-            return Ok(SwitchResult::Switch(pure_data));
-        }
-
-        // Now hmac does not match. We have to acc the counter and do copy.
-        application_data_count += 1;
-        let mut to_copy = data_size - HMAC_SIZE_V2;
-        while to_copy != 0 {
-            let max_read = data_buf.capacity().min(to_copy);
-            let buf = SliceMut::new(data_buf, 0, max_read);
-            let (read_res, buf) = read_half.read(buf).await;
-
-            // if EOF, close write half.
-            let read_len = read_res?;
-            if read_len == 0 {
-                let _ = write_half.shutdown().await;
-                return Err(std::io::ErrorKind::UnexpectedEof.into());
-            }
-
-            let buf = buf.into_inner().slice(0..read_len);
-            let (write_res, buf) = write_half.write_all(buf).await;
-            to_copy -= write_res?;
-            data_buf = buf.into_inner();
-        }
-
-        if application_data_count > 3 {
-            tracing::debug!("hmac not matches after 3 times, fallback to direct");
-            return Ok(SwitchResult::DirectProxy);
-        }
-    }
-}
-
-/// Read from connection and parse the frame.
-/// Return consumed data and SNI.
-///
-/// Only used by V2 protocol.
-async fn extract_sni_v2<R: AsyncReadRent>(mut r: R) -> std::io::Result<(Vec<u8>, Option<Vec<u8>>)> {
-    macro_rules! read_ok {
-        ($res: expr, $data: expr) => {
-            match $res {
-                Ok(r) => r,
-                Err(_) => {
-                    return Ok(($data, None));
-                }
-            }
-        };
-    }
-
-    let header = vec![0; TLS_HEADER_SIZE];
-    let (res, header) = r.read_exact(header).await;
-    res?;
-
-    // validate header and fail fast
-    if header[0] != HANDSHAKE
-        || header[1] != TLS_MAJOR
-        || (header[2] != TLS_MINOR.0 && header[2] != TLS_MINOR.1)
-    {
-        return Ok((header, None));
-    }
-
-    // read tls frame length
-    let mut size: [u8; 2] = Default::default();
-    size.copy_from_slice(&header[3..5]);
-    let data_size = u16::from_be_bytes(size);
-    tracing::debug!("read handshake length {}", data_size);
-
-    // read tls frame
-    let mut data = vec![0; data_size as usize + TLS_HEADER_SIZE];
-    unsafe { copy_nonoverlapping(header.as_ptr(), data.as_mut_ptr(), TLS_HEADER_SIZE) };
-    let (res, data_slice) = r.read_exact(data.slice_mut(TLS_HEADER_SIZE..)).await;
-    res?;
-
-    // validate client hello
-    let data_slice: SliceMut<Vec<u8>> = data_slice;
-    let data = data_slice.into_inner();
-    let mut cursor = std::io::Cursor::new(&data[TLS_HEADER_SIZE..]);
-    if read_ok!(cursor.read_u8(), data) != CLIENT_HELLO {
-        tracing::debug!("first packet is not client hello");
-        return Ok((data, None));
-    }
-    // length[0] must be 0
-    if read_ok!(cursor.read_u8(), data) != 0 {
-        tracing::debug!("client hello length first byte is not zero");
-        return Ok((data, None));
-    }
-    // client hello length[1..=2]
-    let prot_size = read_ok!(cursor.read_u16::<BigEndian>(), data);
-    if prot_size + 4 > data_size {
-        tracing::debug!("invalid client hello length");
-        return Ok((data, None));
-    }
-    // reset cursor with new smaller length limit
-    // TLS header (5 bytes) + handshake type (1) + length (3) = 9 bytes
-    const CH_BODY_OFFSET: usize = TLS_HEADER_SIZE + 1 + 3;
-    let mut cursor = std::io::Cursor::new(
-        &data[CH_BODY_OFFSET..CH_BODY_OFFSET + prot_size as usize],
-    );
-    // skip 2 byte version
-    read_ok!(cursor.read_u16::<BigEndian>(), data);
-    // skip 32 byte random
-    read_ok!(cursor.skip(TLS_RANDOM_SIZE), data);
-    // skip session id
-    read_ok!(cursor.skip_by_u8(), data);
-    // skip cipher suites
-    read_ok!(cursor.skip_by_u16(), data);
-    // skip compression method
-    read_ok!(cursor.skip_by_u8(), data);
-    // skip ext length
-    read_ok!(cursor.read_u16::<BigEndian>(), data);
-
-    loop {
-        let ext_type = read_ok!(cursor.read_u16::<BigEndian>(), data);
-        if ext_type != SNI_EXT_TYPE {
-            read_ok!(cursor.skip_by_u16(), data);
-            continue;
-        }
-        tracing::debug!("found server_name extension");
-        let _ext_len = read_ok!(cursor.read_u16::<BigEndian>(), data);
-        let _sni_len = read_ok!(cursor.read_u16::<BigEndian>(), data);
-        // must be host_name
-        if read_ok!(cursor.read_u8(), data) != 0 {
-            return Ok((data, None));
-        }
-        let sni = Some(read_ok!(cursor.read_by_u16(), data));
-        return Ok((data, sni));
-    }
-}
 
 /// Read a single frame and return Vec.
 ///

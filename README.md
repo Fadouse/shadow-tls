@@ -39,11 +39,11 @@ Normally you need to deploy this service on both sides of the firewall. And it i
 For more detailed usage guide, please refer to [Wiki](https://github.com/ihciah/shadow-tls/wiki/How-to-Run).
 
 ## How it Works
-On client side, just do tls handshake. And for server, we have to relay data as well as parsing tls handshake to handshaking server which will provide valid certificate. We need to know when the tls handshaking is finished. Once finished, we can relay data to our real server.
+On client side, do a real TLS handshake using BoringSSL (Chrome's TLS library) for an authentic browser fingerprint. The server relays the handshake to a real TLS server, authenticates the client via a signed SessionID, and switches to encrypted data relay after handshake completion. All data is protected with per-frame AES-128-GCM.
 
-Full design doc is here: [v2](./docs/protocol-en.md) | [v3](./docs/protocol-v3-en.md).
+Full V3 protocol design: [English](./docs/protocol-v3-en.md) | [中文](./docs/protocol-v3-zh.md).
 
-完整的协议设计: [v2](./docs/protocol-zh.md) | [v3](./docs/protocol-v3-zh.md).
+Legacy protocol docs (V1/V2, no longer supported): [English](./docs/protocol-en.md) | [中文](./docs/protocol-zh.md).
 
 ## Note
 This project relies on [Monoio](https://github.com/bytedance/monoio) which is a high performance rust async runtime with io_uring. However, it does not support windows yet. So this project does not support windows.
