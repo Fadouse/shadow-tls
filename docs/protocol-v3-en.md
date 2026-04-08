@@ -1,7 +1,7 @@
 ---
 title: ShadowTLS V3 Protocol
 date: 2023-02-06 11:00:00
-updated: 2023-02-11 20:00:00
+updated: 2026-04-08 00:00:00
 author: ihciah
 ---
 
@@ -52,18 +52,76 @@ The client's ReadWrapper needs to parse the ApplicationData frame and determine 
 2. If Client pretends the data is decrypted successfully and sends the data directly, it will not be able to pass because of the data frame checksum.
 
 # Data Encapsulation
+
 The V2 version of the data encapsulation protocol is in fact not resistant to traffic hijacking, e.g., the middleman may tamper with this part of the data after the handshake is completed, and we need to be able to respond to Alert; the middleman may also split one ApplicationData package into two as in the V2 protocol, which can also be used to identify the protocol if the connection is normal.
 
 To deal with traffic hijacking, in addition to optimizing the handshake process, the data encapsulation part also needs to be redesigned. We need to be able to authenticate the data stream and resist attacks such as replay, data tampering, data slicing, and data disorder.
 
-In addition to continuing to use ApplicationData encapsulation for the outermost layer of data, we added a 4 byte HMAC computed value to the inner layer. After we create the HMAC instance with the preshared key, we fill in `ServerRandom+"C"` or `ServerRandom+"S"` as the initial value, the former corresponds to the sent data stream of the Client, the latter corresponds to the sent data stream of the Server (the purpose is to prevent the man-in-the-middle from sending back the data we sent, or replaying (the purpose is to prevent the middleman from sending back the data we sent or replaying the data from different connections). In the forwarding process, the pure data is first filled into the HMAC instance, and then the 4 byte value is calculated and placed at the top of the pure data. The encapsulated data frame format: (5B tls frame header)(4B HMAC)(data). After encapsulation, the 4 byte data is fed into the HMAC instance (to avoid man-in-the-middle cut splicing requests).
+## Key Derivation
 
-When the data checksum fails, we need to send a TLS Alert immediately to close the connection properly. We also need to be able to close the connection correctly when it is broken.
+After the TLS handshake completes and ServerRandom is known, both sides derive per-direction keys using **HKDF-SHA256**:
+
+```
+key_c2s = HKDF-SHA256(IKM=password, salt=ServerRandom, info="c2s")
+key_s2c = HKDF-SHA256(IKM=password, salt=ServerRandom, info="s2c")
+```
+
+Each key is 256 bits. The use of ServerRandom as the HKDF salt binds the data-phase keys to the specific TLS session, preventing cross-session replay attacks.
+
+## Per-Frame Authentication
+
+Each ApplicationData frame is independently authenticated with **HMAC-SHA256** (truncated to 16 bytes):
+
+```
+tag = HMAC-SHA256(key, seq_be32 || tls_header || inner_payload)[..16]
+```
+
+- `seq_be32`: 32-bit frame sequence number (big-endian), starts at 0 and increments per frame per direction. This provides strict ordering — any out-of-order or replayed frame will fail verification.
+- `tls_header`: the 5-byte TLS record header (`type || major || minor || len_hi || len_lo`). Including the header in the MAC prevents header manipulation (e.g., length field tampering).
+- `inner_payload`: the frame body after the HMAC tag (inner header + data + padding).
+
+The encapsulated frame format is:
+
+```
+(5B TLS record header)(16B HMAC-SHA256 tag)(1B CMD)(2B DATA_LEN)(user data)(optional padding)
+```
+
+**Strict sequence policy**: once a connection has been authenticated (first valid HMAC frame received), any subsequent HMAC verification failure results in immediate disconnection without retrying. This eliminates oracle attacks on the sequence counter.
+
+**AuthPending resource limits**: while waiting for the first authenticated frame (e.g., during NewSessionTicket drain), non-matching ApplicationData frames are discarded silently. This state has two hard limits: 64 KiB of discarded bytes and 10 seconds of elapsed time. Exceeding either limit triggers disconnection.
+
+## Inner Framing (Anti TLS-in-TLS)
+
+To prevent statistical detection of inner-protocol traffic fingerprints (e.g., Shadowsocks's characteristic first-packet sizes), each ApplicationData payload carries a 3-byte inner header:
+
+```
+[CMD : 1 byte][DATA_LEN : 2 bytes big-endian][user data : DATA_LEN bytes][padding : variable]
+```
+
+- `CMD = 0x01` (DATA): the frame carries `DATA_LEN` bytes of real user data, followed by zero or more padding bytes. The receiver writes only `DATA_LEN` bytes to the downstream.
+- `CMD = 0x00` (PADDING): pure waste frame, receiver discards the entire payload.
+
+Padding is **inside** the HMAC-authenticated region, so it is authenticated along with the user data.
+
+### Padding Strategy
+
+For the first **8** data packets sent in each direction, the sender targets a random TLS record payload size chosen from traffic-profile-aware ranges:
+
+| Packet index | Target payload range | Mimics |
+|---|---|---|
+| 0 (first) | 200 – 600 bytes | HTTP request / small response |
+| 1 | 800 – 1 400 bytes | HTTP response headers |
+| 2 – 7 | 500 – 1 400 bytes | HTTP response body chunks |
+
+If the actual user data is already larger than the target, no padding is added (data is never truncated). After the 8th packet, no padding is inserted and the raw data length is used.
 
 ## Security Verification
-1. For man-in-the-middle data tampering, HMAC will directly verify it and will respond to Alert.
-2. For man-in-the-middle disorder attack, HMAC will directly verify it and respond to Alert.
-3. For cut and splice attack (merging two AppData), although HMAC is processing the data stream, we can interrupt two consecutive streams to defend against this attack because we update in an additional 4 byte value after the processing is completed.
+
+1. For man-in-the-middle data tampering, the per-frame HMAC will immediately detect it and the connection is closed with a TLS Alert.
+2. For replay attacks across connections, the HKDF-derived key is bound to `ServerRandom`, making keys unique per TLS session.
+3. For replay or reorder attacks within a connection, the 32-bit sequence number in the HMAC input ensures any out-of-order delivery fails verification and triggers strict disconnect.
+4. For header manipulation (e.g., TLS record length tampering), including the TLS record header in the HMAC covers this attack surface.
+5. For TLS-in-TLS fingerprinting, the padding system randomises the first 8 packet sizes to match typical HTTPS traffic, eliminating inner-protocol statistical signatures.
 
 # Implementation Guide
 ## Client
@@ -78,13 +136,14 @@ ReadWrapper. 1:
     2. Use `HMAC_ServerRandom` for ApplicationData to determine if the HMAC of the frame content (without the 4byte HMAC) matches the first 4 bytes. If it matches, rewrite the data frame content to its XOR SHA256(PreSharedKey + ServerRandom) and remove the first 4 byte HMAC value. If it does not match, no changes are made and the connection is marked as hijacked and a muddled request is sent after a successful handshake; if the handshake fails, no processing is done.
 
 Stage2: Data forwarding (this process does not rely on TLS library)
-1. Create `HMAC_ServerRandomC` and `HMAC_ServerRandomS`. 2.
-2. Parse Application Data wrapping when reading the connection and verify the first 4 bytes of data using `HMAC_ServerRandomS` and `HMAC_ServerRandom`.
-    1. `HMAC_ServerRandom` passes the validation, which means this is the residual handshake data, so it is ignored.
-    2. `HMAC_ServerRandomS` passes the validation, it means this is our own data encapsulation, after that `HMAC_ServerRandom` branch is disabled and the data is forwarded to the user (without HMAC)
-    3. if none of them pass, the data will be handled as Alert bad_record_mac. 4.
-    Note: Here the Server is allowed to send residual TLS frames to the Client after the Client has finished switching, and the Client is responsible for filtering them out. This is because Server does not strongly sense the end of TLS handshake, it only senses the data sent by Client after the switchover. 3.
-3. add Application Data and HMAC when writing connection, HMAC is calculated by `HMAC_ServerRandomC`.
+1. Derive `key_c2s` and `key_s2c` via HKDF-SHA256 using ServerRandom as salt.
+2. Parse ApplicationData frames when reading from the server connection and verify the 16-byte HMAC tag using `key_s2c` and the current `seq_s2c` counter.
+    1. If HMAC passes (state = AuthPending): transition to Authenticated, parse the inner frame, extract `DATA_LEN` bytes of user data (discard padding), forward to user.
+    2. If HMAC passes (state = Authenticated): same as above. Pure padding frames (`CMD=0x00`) are silently discarded.
+    3. If HMAC fails (state = AuthPending): this may be a residual handshake frame (NewSessionTicket etc.); discard silently. Resource limits apply (64 KiB / 10 s).
+    4. If HMAC fails (state = Authenticated): strict disconnect — send TLS Alert and close.
+    Note: The Server is allowed to send residual TLS frames after the Client has switched; the Client filters them during the AuthPending state.
+3. When writing to the server connection, wrap user data in ApplicationData with inner framing and HMAC using `key_c2s`, incrementing `seq_c2s`. Apply padding for the first 8 frames.
 
 ## Server-side
 The server is responsible for forwarding the TLS handshake, determining the timing of the switch, and encapsulating and decapsulating the data after the switch, without relying on the TLS library.
@@ -98,6 +157,6 @@ Start two-way forwarding (with Handshake Server).
     3. Handshake Server -> ShadowTLS Client: modify the Application Data frame by doing XOR SHA256 (PreSharedKey + ServerRandom) on the data and adding 4 byte HMAC in the header (calculated by `HMAC_ ServerRandom`).
 
 Stage2: Data forwarding (with Data Server)
-1. Create `HMAC_ServerRandomS`.
-2. ShadowTLS Client -> Data Server: Parse Application Data encapsulation and verify the first 4 bytes of data with `HMAC_ServerRandomC`. If it fails, it will be treated as Alert bad_record_mac. After validation is complete, the 4 bytes of data are also entered into the `HMAC_ServerRandomC` instance.
-3. Data Server -> ShadowTLS Client: Add Application Data with HMAC, which is calculated by `HMAC_ServerRandomS`. The 4 bytes of data is then also entered into the `HMAC_ServerRandomS` instance.
+1. Derive `key_c2s` and `key_s2c` via HKDF-SHA256 using ServerRandom as salt.
+2. ShadowTLS Client → Data Server: Parse ApplicationData encapsulation, verify the 16-byte HMAC tag using `key_c2s` and `seq_c2s`. Any mismatch is treated as Alert bad_record_mac. On success, parse the inner frame, extract the real user data bytes (discarding padding), and forward to the Data Server.
+3. Data Server → ShadowTLS Client: Wrap data in ApplicationData with inner framing and HMAC using `key_s2c`, incrementing `seq_s2c`. Apply padding to the first 8 frames.

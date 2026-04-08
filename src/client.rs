@@ -1,12 +1,11 @@
 use std::{
     future::Future,
-    ptr::{copy, copy_nonoverlapping},
+    ptr::copy_nonoverlapping,
     rc::Rc,
     sync::Arc,
 };
 
 use anyhow::bail;
-use byteorder::{BigEndian, WriteBytesExt};
 use monoio::{
     buf::IoBufMut,
     io::{AsyncReadRent, AsyncReadRentExt, AsyncWriteRent, AsyncWriteRentExt, Splitable},
@@ -21,8 +20,8 @@ use serde::{de::Visitor, Deserialize};
 use crate::{
     helper_v2::{copy_with_application_data, copy_without_application_data, HashedReadStream},
     util::{
-        bind_with_pretty_error, kdf, mod_tcp_conn, prelude::*, resolve, support_tls13,
-        verified_relay, xor_slice, Hmac, V3Mode,
+        bind_with_pretty_error, mod_tcp_conn, prelude::*, resolve, support_tls13,
+        verified_relay, FrameHmac, Hmac, V3Mode,
     },
 };
 
@@ -247,7 +246,7 @@ impl ShadowTlsClient {
 
         // stage1: handshake with wrapper
         let hamc_sr = Hmac::new(&self.password, (&[], &[]));
-        let stream = StreamWrapper::new(stream, &self.password);
+        let stream = StreamWrapper::new(stream);
         let sni = self.tls_names.random_choose().clone();
         let tls_stream = self
             .tls_connector
@@ -259,14 +258,11 @@ impl ShadowTlsClient {
         let (stream, session) = tls_stream.into_parts();
         let authorized = stream.authorized();
         let tls13 = stream.tls13;
-        let maybe_srh = stream
-            .state()
-            .as_ref()
-            .map(|s| (s.server_random, s.hmac.to_owned()));
+        let maybe_sr = stream.state().as_ref().map(|s| s.server_random);
         let stream = stream.into_inner();
 
         // stage2:
-        if (maybe_srh.is_none() || !authorized) && self.v3.strict() {
+        if (maybe_sr.is_none() || !authorized) && self.v3.strict() {
             tracing::warn!("V3 strict enabled: traffic hijacked or TLS1.3 is not supported");
             let tls_stream = monoio_rustls_fork_shadow_tls::ClientTlsStream::new(stream, session);
             if let Err(e) = fake_request(tls_stream).await {
@@ -276,18 +272,19 @@ impl ShadowTlsClient {
         }
 
         drop(session);
-        let (sr, hmac_sr) = maybe_srh.unwrap();
+        let sr = maybe_sr.unwrap();
         tracing::debug!("Authorized, ServerRandom extracted: {sr:?}");
-        let hmac_sr_s = Hmac::new(&self.password, (&sr, b"S"));
-        let hmac_sr_c = Hmac::new(&self.password, (&sr, b"C"));
+        // Per-frame HMAC with direction-separated keys
+        let frame_hmac_c2s = FrameHmac::new(&self.password, &sr, b"c2s");
+        let frame_hmac_s2c = FrameHmac::new(&self.password, &sr, b"s2c");
 
         verified_relay(
             in_stream,
             stream,
-            hmac_sr_c,
-            hmac_sr_s,
-            Some(hmac_sr),
+            frame_hmac_c2s,
+            frame_hmac_s2c,
             !tls13,
+            true, // client: auth_pending until first HMAC-verified server frame
         )
         .await;
         Ok(())
@@ -327,7 +324,6 @@ impl ShadowTlsClient {
 /// Only used by V3 protocol.
 struct StreamWrapper<S> {
     raw: S,
-    password: String,
 
     read_buf: Option<Vec<u8>>,
     read_pos: usize,
@@ -340,15 +336,12 @@ struct StreamWrapper<S> {
 #[derive(Clone)]
 struct State {
     server_random: [u8; TLS_RANDOM_SIZE],
-    hmac: Hmac,
-    key: Vec<u8>,
 }
 
 impl<S> StreamWrapper<S> {
-    fn new(raw: S, password: &str) -> Self {
+    fn new(raw: S) -> Self {
         Self {
             raw,
-            password: password.to_string(),
 
             read_buf: Some(Vec::new()),
             read_pos: 0,
@@ -409,9 +402,9 @@ impl<S: AsyncReadRent> StreamWrapper<S> {
             self.read_buf = Some(buf.into_inner());
             return Err(e);
         }
-        let mut buf: Vec<u8> = buf.into_inner();
+        let buf: Vec<u8> = buf.into_inner();
 
-        // do extraction and modification
+        // do extraction
         match buf[0] {
             HANDSHAKE => {
                 if buf.len() > SERVER_RANDOM_IDX + TLS_RANDOM_SIZE && buf[5] == SERVER_HELLO {
@@ -425,40 +418,17 @@ impl<S: AsyncReadRent> StreamWrapper<S> {
                         )
                     }
                     tracing::debug!("ServerRandom extracted: {server_random:?}");
-                    let hmac = Hmac::new(&self.password, (&server_random, &[]));
-                    let key = kdf(&self.password, &server_random);
                     self.read_state = Some(State {
                         server_random,
-                        hmac,
-                        key,
                     });
                     self.tls13 = support_tls13(&buf);
                 }
             }
             APPLICATION_DATA => {
-                self.read_authorized = false;
-                if buf.len() > TLS_HMAC_HEADER_SIZE {
-                    if let Some(State { hmac, key, .. }) = self.read_state.as_mut() {
-                        hmac.update(&buf[TLS_HMAC_HEADER_SIZE..]);
-                        if hmac.finalize() == buf[TLS_HEADER_SIZE..TLS_HMAC_HEADER_SIZE] {
-                            xor_slice(&mut buf[TLS_HMAC_HEADER_SIZE..], key);
-                            unsafe {
-                                copy(
-                                    buf.as_ptr().add(TLS_HMAC_HEADER_SIZE),
-                                    buf.as_mut_ptr().add(5),
-                                    buf.len() - 9,
-                                )
-                            };
-                            (&mut buf[3..5])
-                                .write_u16::<BigEndian>(data_size as u16 - HMAC_SIZE as u16)
-                                .unwrap();
-                            unsafe { buf.set_init(buf.len() - HMAC_SIZE) };
-                            self.read_authorized = true;
-                        } else {
-                            tracing::debug!("app data verification failed");
-                        }
-                    }
-                }
+                // Handshake frames are relayed verbatim (no XOR/HMAC modification)
+                // to avoid detectable frame length changes (anti-aparecium).
+                // Authorization is based on successful ServerRandom extraction.
+                self.read_authorized = self.read_state.is_some();
             }
             _ => {}
         }
@@ -585,7 +555,7 @@ fn generate_session_id(hmac: &Hmac, buf: &[u8]) -> [u8; TLS_SESSION_ID_SIZE] {
     }
 
     let mut session_id = [0; TLS_SESSION_ID_SIZE];
-    rand::thread_rng().fill(&mut session_id[..TLS_SESSION_ID_SIZE - HMAC_SIZE]);
+    rand::thread_rng().fill(&mut session_id[..TLS_SESSION_ID_SIZE - SESSION_HMAC_SIZE]);
     let mut hmac = hmac.to_owned();
     hmac.update(&buf[0..SESSION_ID_START]);
     hmac.update(&session_id);
@@ -594,8 +564,8 @@ fn generate_session_id(hmac: &Hmac, buf: &[u8]) -> [u8; TLS_SESSION_ID_SIZE] {
     unsafe {
         copy_nonoverlapping(
             hmac_val.as_ptr(),
-            session_id.as_mut_ptr().add(TLS_SESSION_ID_SIZE - HMAC_SIZE),
-            HMAC_SIZE,
+            session_id.as_mut_ptr().add(TLS_SESSION_ID_SIZE - SESSION_HMAC_SIZE),
+            SESSION_HMAC_SIZE,
         )
     }
     tracing::debug!("ClientHello before sign: {buf:?}, session_id {session_id:?}");

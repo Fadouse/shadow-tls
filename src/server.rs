@@ -1,13 +1,13 @@
 use std::{
     borrow::Cow,
     collections::VecDeque,
-    ptr::{copy, copy_nonoverlapping},
+    ptr::copy_nonoverlapping,
     rc::Rc,
     sync::Arc,
 };
 
 use anyhow::bail;
-use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
+use byteorder::{BigEndian, ReadBytesExt};
 use local_sync::oneshot::Sender;
 use monoio::{
     buf::{IoBuf, IoBufMut, Slice, SliceMut},
@@ -25,8 +25,8 @@ use crate::{
         FutureOrOutput, HashedWriteStream, HmacHandler, HMAC_SIZE_V2,
     },
     util::{
-        bind_with_pretty_error, copy_bidirectional, copy_until_eof, kdf, mod_tcp_conn, prelude::*,
-        resolve, support_tls13, verified_relay, xor_slice, CursorExt, Hmac, V3Mode,
+        bind_with_pretty_error, copy_bidirectional, copy_until_eof, mod_tcp_conn, prelude::*,
+        resolve, support_tls13, verified_relay, CursorExt, FrameHmac, Hmac, V3Mode,
     },
     WildcardSNI,
 };
@@ -309,43 +309,50 @@ impl ShadowTlsServer {
             return Ok(());
         }
 
-        // stage 1.3.1: create HMAC_ServerRandomC and HMAC_ServerRandom
-        let mut hmac_sr_c = Hmac::new(&self.password, (&server_random, b"C"));
-        let hmac_sr_s = Hmac::new(&self.password, (&server_random, b"S"));
-        let mut hmac_sr = Hmac::new(&self.password, (&server_random, &[]));
+        // stage 1.3.1: create per-frame HMAC with direction-separated keys
+        let mut frame_hmac_c2s = FrameHmac::new(&self.password, &server_random, b"c2s");
+        let frame_hmac_s2c = FrameHmac::new(&self.password, &server_random, b"s2c");
 
-        // stage 1.3.2: copy ShadowTLS Client -> Handshake Server until hamc matches
-        // stage 1.3.3: copy and modify Handshake Server -> ShadowTLS Client until 1.3.2 stops
+        // stage 1.3.2: copy ShadowTLS Client -> Handshake Server until hmac matches
+        // stage 1.3.3: copy Handshake Server -> ShadowTLS Client verbatim (no modification)
+        //
+        // Event-driven drain: after client HMAC detected, shutdown h_write (TCP FIN).
+        // The handshake server processes ClientFinished, sends NewSessionTickets, then
+        // sees EOF and closes. The verbatim relay reads until h_read EOF (event-driven,
+        // no sleep/timeout). A safety timeout prevents indefinite blocking if the
+        // handshake server misbehaves.
         let (mut c_read, mut c_write) = in_stream.into_split();
         let pure_data = {
             let (mut h_read, mut h_write) = handshake_stream.into_split();
-            let (mut sender, mut recevier) = local_sync::oneshot::channel::<()>();
-            let key = kdf(&self.password, &server_random);
+            let (mut stop_tx, mut stop_rx) = local_sync::oneshot::channel::<()>();
             let (maybe_pure, _) = monoio::join!(
                 async {
-                    let r =
-                        copy_by_frame_until_hmac_matches(&mut c_read, &mut h_write, &mut hmac_sr_c)
-                            .await;
-                    recevier.close();
-                    if r.is_err() {
-                        let _ = h_write.shutdown().await;
-                    }
+                    let r = copy_by_frame_until_hmac_matches(
+                        &mut c_read,
+                        &mut h_write,
+                        &mut frame_hmac_c2s,
+                    )
+                    .await;
+                    // Shutdown write to handshake server (TCP FIN). Handshake server
+                    // processes ClientFinished, sends NewSessionTickets, then closes.
+                    let _ = h_write.shutdown().await;
                     r
                 },
                 async {
-                    let r = copy_by_frame_with_modification(
+                    // Relay handshake server → client verbatim, concurrently.
+                    // Terminates on: EOF from handshake server, stop signal, or idle timeout.
+                    let _ = copy_by_frame_verbatim(
                         &mut h_read,
                         &mut c_write,
-                        &mut hmac_sr,
-                        &key,
-                        &mut sender,
+                        &mut stop_tx,
                     )
                     .await;
-                    if r.is_err() {
-                        let _ = c_write.shutdown().await;
-                    }
+                    // Do NOT shutdown c_write — the client TCP continues in data phase.
                 }
             );
+            // After verbatim relay ends (handshake server EOF), close the stop channel
+            // to let any pending safety logic terminate.
+            stop_rx.close();
             maybe_pure?
         };
         tracing::debug!("handshake relay finished");
@@ -362,10 +369,10 @@ impl ShadowTlsServer {
         verified_relay(
             data_stream,
             unsafe { c_read.reunite(c_write).unwrap_unchecked() },
-            hmac_sr_s,
-            hmac_sr_c,
-            None,
+            frame_hmac_s2c,
+            frame_hmac_c2s,
             !use_tls13,
+            false, // server: already authenticated client via SessionID + first HMAC frame
         )
         .await;
         Ok(())
@@ -637,8 +644,10 @@ async fn extract_sni_v2<R: AsyncReadRent>(mut r: R) -> std::io::Result<(Vec<u8>,
         return Ok((data, None));
     }
     // reset cursor with new smaller length limit
+    // TLS header (5 bytes) + handshake type (1) + length (3) = 9 bytes
+    const CH_BODY_OFFSET: usize = TLS_HEADER_SIZE + 1 + 3;
     let mut cursor = std::io::Cursor::new(
-        &data[TLS_HMAC_HEADER_SIZE..TLS_HMAC_HEADER_SIZE + prot_size as usize],
+        &data[CH_BODY_OFFSET..CH_BODY_OFFSET + prot_size as usize],
     );
     // skip 2 byte version
     read_ok!(cursor.read_u16::<BigEndian>(), data);
@@ -715,8 +724,8 @@ async fn read_exact_frame_into(
 fn verified_extract_sni(frame: &[u8], password: &str) -> (bool, Option<Vec<u8>>) {
     // 5 frame header + 1 handshake type + 3 length + 2 version + 32 random + 1 session id len + 32 session id
     const MIN_LEN: usize = TLS_HEADER_SIZE + 1 + 3 + 2 + TLS_RANDOM_SIZE + 1 + TLS_SESSION_ID_SIZE;
-    const HMAC_IDX: usize = SESSION_ID_LEN_IDX + 1 + TLS_SESSION_ID_SIZE - HMAC_SIZE;
-    const ZERO4B: [u8; HMAC_SIZE] = [0; HMAC_SIZE];
+    const HMAC_IDX: usize = SESSION_ID_LEN_IDX + 1 + TLS_SESSION_ID_SIZE - SESSION_HMAC_SIZE;
+    const ZERO4B: [u8; SESSION_HMAC_SIZE] = [0; SESSION_HMAC_SIZE];
 
     if frame.len() < SESSION_ID_LEN_IDX || frame[0] != HANDSHAKE || frame[5] != CLIENT_HELLO {
         return (false, None);
@@ -728,8 +737,8 @@ fn verified_extract_sni(frame: &[u8], password: &str) -> (bool, Option<Vec<u8>>)
         let mut hmac = Hmac::new(password, (&[], &[]));
         hmac.update(&frame[TLS_HEADER_SIZE..HMAC_IDX]);
         hmac.update(&ZERO4B);
-        hmac.update(&frame[HMAC_IDX + HMAC_SIZE..]);
-        hmac.finalize() == frame[HMAC_IDX..HMAC_IDX + HMAC_SIZE]
+        hmac.update(&frame[HMAC_IDX + SESSION_HMAC_SIZE..]);
+        hmac.finalize() == frame[HMAC_IDX..HMAC_IDX + SESSION_HMAC_SIZE]
     };
 
     let mut cursor = std::io::Cursor::new(&frame[SESSION_ID_LEN_IDX..]);
@@ -795,29 +804,49 @@ fn extract_server_random(frame: &[u8]) -> Option<[u8; TLS_RANDOM_SIZE]> {
     Some(server_random)
 }
 
-/// Copy frame by frame until a appdata frame matches hmac.
-/// Return the matched pure data(without header).
+/// Copy frame by frame until an appdata frame matches HMAC.
+/// Return the matched pure data (without header).
+///
+/// Uses FrameHmac: failed verifications do NOT corrupt state (seq unchanged).
 ///
 /// Only used by V3 protocol.
 async fn copy_by_frame_until_hmac_matches(
     mut read: impl AsyncReadRent,
     mut write: impl AsyncWriteRent,
-    hmac: &mut Hmac,
+    hmac: &mut FrameHmac,
 ) -> std::io::Result<Vec<u8>> {
     let mut g_buffer = Vec::new();
+    let mut hmac_matched = false;
 
     loop {
         let buffer = read_exact_frame_into(&mut read, g_buffer).await?;
-        if buffer.len() > 9 && buffer[0] == APPLICATION_DATA {
-            // check hmac
-            let mut tmp_hmac = hmac.to_owned();
-            tmp_hmac.update(&buffer[TLS_HMAC_HEADER_SIZE..]);
-            let h = tmp_hmac.finalize();
+        if buffer.len() > TLS_HMAC_HEADER_SIZE && buffer[0] == APPLICATION_DATA {
+            let header = &buffer[..TLS_HEADER_SIZE];
+            let payload = &buffer[TLS_HMAC_HEADER_SIZE..];
+            let mut tag = [0u8; HMAC_SIZE];
+            tag.copy_from_slice(&buffer[TLS_HEADER_SIZE..TLS_HMAC_HEADER_SIZE]);
 
-            if buffer[TLS_HEADER_SIZE..TLS_HMAC_HEADER_SIZE] == h {
-                hmac.update(&buffer[TLS_HMAC_HEADER_SIZE..]);
-                hmac.update(&buffer[TLS_HEADER_SIZE..TLS_HMAC_HEADER_SIZE]);
-                return Ok(buffer[TLS_HMAC_HEADER_SIZE..].to_vec());
+            if !hmac_matched {
+                hmac_matched = hmac.verify_and_advance(header, payload, &tag);
+            }
+
+            if hmac_matched {
+                // Parse inner framing to extract actual user data (strip padding)
+                match crate::util::parse_inner_frame(payload) {
+                    Some((CMD_DATA, data)) if !data.is_empty() => {
+                        return Ok(data.to_vec());
+                    }
+                    Some((CMD_PADDING, _)) | Some((CMD_DATA, _)) => {
+                        g_buffer = buffer;
+                        continue;
+                    }
+                    _ => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "malformed inner frame in HMAC-matched packet",
+                        ));
+                    }
+                }
             }
         }
 
@@ -827,19 +856,23 @@ async fn copy_by_frame_until_hmac_matches(
     }
 }
 
-/// Copy frame by frame.
-/// Modify appdata frame:
-/// 1. Cycle XOR xor data.
-/// 2. Calculate HMAC and insert before the frame data.
+/// Copy frame by frame verbatim (no modification).
+/// Relay handshake server frames to client without altering content or length.
+/// This avoids detectable frame length changes (e.g., ServerFinished 53→57).
+///
+/// Has an idle timeout (30s) to protect against half-dead connections where
+/// the handshake server never sends EOF.
 ///
 /// Only used by V3 protocol.
-async fn copy_by_frame_with_modification(
+async fn copy_by_frame_verbatim(
     mut read: impl AsyncReadRent,
     mut write: impl AsyncWriteRent,
-    hmac: &mut Hmac,
-    xor: &[u8],
     stop: &mut Sender<()>,
 ) -> std::io::Result<()> {
+    /// Idle timeout for drain relay: if no frame arrives within this duration,
+    /// assume the connection is half-dead and stop.
+    const DRAIN_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
     let mut g_buffer = Vec::new();
     let stop = stop.closed();
     let mut stop = std::pin::pin!(stop);
@@ -851,31 +884,15 @@ async fn copy_by_frame_with_modification(
                 return Ok(());
             },
             buffer_res = read_exact_frame_into(&mut read, g_buffer) => {
-                let mut buffer = buffer_res?;
-                // Note: if we get frame, it is guaranteed valid.
-                if buffer[0] == APPLICATION_DATA {
-                    // do modification: xor data, add 4-byte hmac, update tls frame length
-                    xor_slice(&mut buffer[TLS_HEADER_SIZE..], xor);
-                    hmac.update(&buffer[TLS_HEADER_SIZE..]);
-                    let hash = hmac.finalize();
-                    buffer.extend_from_slice(&hash);
-                    unsafe {
-                        copy(buffer.as_ptr().add(TLS_HEADER_SIZE), buffer.as_mut_ptr().add(TLS_HMAC_HEADER_SIZE), buffer.len() - TLS_HMAC_HEADER_SIZE);
-                        copy_nonoverlapping(hash.as_ptr(), buffer.as_mut_ptr().add(TLS_HEADER_SIZE), HMAC_SIZE);
-                    }
-
-                    let mut size: [u8; 2] = Default::default();
-                    size.copy_from_slice(&buffer[3..5]);
-                    let data_size = u16::from_be_bytes(size);
-                    // Normally it does not overflow.
-                    let data_size = data_size.wrapping_add(HMAC_SIZE as u16);
-                    (&mut buffer[3..5]).write_u16::<BigEndian>(data_size).unwrap();
-                }
-
+                let buffer = buffer_res?;
                 // writing is not cancelable
                 let (res, buffer) = write.write_all(buffer).await;
                 res?;
                 g_buffer = buffer;
+            },
+            _ = monoio::time::sleep(DRAIN_IDLE_TIMEOUT) => {
+                tracing::warn!("drain relay: idle timeout ({DRAIN_IDLE_TIMEOUT:?}), stopping");
+                return Ok(());
             }
         }
     }

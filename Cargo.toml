@@ -18,6 +18,7 @@ anyhow = "1"
 byteorder = "1"
 clap = { version = "4", features = ["derive"] }
 ctrlc = { version = "3", features = ["termination"] }
+hkdf = "0.12"
 hmac = "0.12"
 local-sync = "0.1.0"
 pin-project-lite = "0.2"

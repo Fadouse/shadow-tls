@@ -13,6 +13,7 @@ use monoio::{
     net::{ListenerOpts, TcpListener, TcpStream},
 };
 
+use hkdf::Hkdf;
 use hmac::Mac;
 use rand::Rng;
 use serde::Deserialize;
@@ -42,7 +43,23 @@ pub(crate) mod prelude {
     pub(crate) const TLS_HMAC_HEADER_SIZE: usize = TLS_HEADER_SIZE + HMAC_SIZE;
 
     pub(crate) const COPY_BUF_SIZE: usize = 4096;
-    pub(crate) const HMAC_SIZE: usize = 4;
+    /// V3 per-frame HMAC tag size (16 bytes = HMAC-SHA256 truncated to 128 bits).
+    pub(crate) const HMAC_SIZE: usize = 16;
+    /// V3 SessionID HMAC size (4 bytes, used for ClientHello authentication).
+    /// This is separate from per-frame HMAC_SIZE since it must fit in the session ID.
+    pub(crate) const SESSION_HMAC_SIZE: usize = 4;
+
+    // Inner framing protocol (anti TLS-in-TLS)
+    /// Inner header: cmd(1) + data_len(2) = 3 bytes, placed after HMAC tag.
+    pub(crate) const INNER_HEADER_SIZE: usize = 3;
+    /// Full overhead per TLS record: TLS header + HMAC + inner header.
+    pub(crate) const FRAME_OVERHEAD: usize = TLS_HEADER_SIZE + HMAC_SIZE + INNER_HEADER_SIZE;
+    /// Inner command: real user data.
+    pub(crate) const CMD_DATA: u8 = 0x01;
+    /// Inner command: padding/waste (receiver discards).
+    pub(crate) const CMD_PADDING: u8 = 0x00;
+    /// Number of initial data packets to pad.
+    pub(crate) const PADDING_COUNT: usize = 8;
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -151,11 +168,13 @@ impl Hmac {
     }
 
     #[inline]
-    pub(crate) fn finalize(&self) -> [u8; HMAC_SIZE] {
+    pub(crate) fn finalize(&self) -> [u8; SESSION_HMAC_SIZE] {
         let hmac = self.0.clone();
         let hash = hmac.finalize().into_bytes();
-        let mut res = [0; HMAC_SIZE];
-        unsafe { copy_nonoverlapping(hash.as_slice().as_ptr(), res.as_mut_ptr(), HMAC_SIZE) };
+        let mut res = [0; SESSION_HMAC_SIZE];
+        unsafe {
+            copy_nonoverlapping(hash.as_slice().as_ptr(), res.as_mut_ptr(), SESSION_HMAC_SIZE)
+        };
         res
     }
 
@@ -165,7 +184,123 @@ impl Hmac {
     }
 }
 
+/// Per-frame HMAC with independent sequence numbers and direction-separated keys.
+///
+/// Key derivation: HKDF-SHA256 with:
+///   - IKM = password
+///   - salt = server_random
+///   - info = direction (b"c2s" or b"s2c")
+///
+/// Each frame is authenticated independently:
+///   tag = HMAC-SHA256(key, seq || header || payload)[..16]
+///
+/// `header` = TLS record header (type + version + length, 5 bytes).
+/// Failed verifications do NOT advance the sequence counter, avoiding state corruption.
+/// In Authenticated state, any tag mismatch = immediate disconnect (strict seq policy).
+pub(crate) struct FrameHmac {
+    key: [u8; 32],
+    seq: u32,
+}
+
+impl FrameHmac {
+    /// Create a new FrameHmac with HKDF-SHA256 derived, direction-separated key.
+    /// `direction` should be b"c2s" or b"s2c".
+    pub(crate) fn new(password: &str, server_random: &[u8], direction: &[u8]) -> Self {
+        let hk = Hkdf::<Sha256>::new(Some(server_random), password.as_bytes());
+        let mut key = [0u8; 32];
+        hk.expand(direction, &mut key)
+            .expect("HKDF-SHA256 expand failed");
+        Self { key, seq: 0 }
+    }
+
+    /// Compute HMAC-SHA256 tag for a frame at the current sequence number.
+    /// `header` is the 5-byte TLS record header; `payload` is the frame body after the HMAC tag.
+    fn compute_tag(&self, header: &[u8], payload: &[u8]) -> [u8; HMAC_SIZE] {
+        let mut mac: hmac::Hmac<Sha256> =
+            hmac::Hmac::new_from_slice(&self.key).expect("unable to build hmac instance");
+        mac.update(&self.seq.to_be_bytes());
+        mac.update(header);
+        mac.update(payload);
+        let hash = mac.finalize().into_bytes();
+        let mut tag = [0u8; HMAC_SIZE];
+        unsafe { copy_nonoverlapping(hash.as_slice().as_ptr(), tag.as_mut_ptr(), HMAC_SIZE) };
+        tag
+    }
+
+    /// Verify tag against frame data. Advances seq only on success.
+    /// `header` = TLS record header (5 bytes), `payload` = data after HMAC tag.
+    pub(crate) fn verify_and_advance(
+        &mut self,
+        header: &[u8],
+        payload: &[u8],
+        tag: &[u8; HMAC_SIZE],
+    ) -> bool {
+        let expected = self.compute_tag(header, payload);
+        if expected == *tag {
+            self.seq += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Compute tag and advance seq. Used when sending.
+    /// `header` = TLS record header (5 bytes), `payload` = frame body.
+    pub(crate) fn tag_and_advance(&mut self, header: &[u8], payload: &[u8]) -> [u8; HMAC_SIZE] {
+        let tag = self.compute_tag(header, payload);
+        self.seq += 1;
+        tag
+    }
+}
+
+/// Padding state for anti TLS-in-TLS.
+///
+/// Tracks how many data packets have been sent and generates target
+/// TLS record payload sizes for the first `PADDING_COUNT` packets.
+/// After that, no padding is added.
+pub(crate) struct PaddingState {
+    sent: usize,
+}
+
+impl PaddingState {
+    pub(crate) fn new() -> Self {
+        Self { sent: 0 }
+    }
+
+    /// Returns the target TLS record *payload* size (= HMAC + inner header + data + padding)
+    /// for the current packet, or None if padding is no longer needed.
+    pub(crate) fn next_target_payload(&mut self) -> Option<usize> {
+        if self.sent >= PADDING_COUNT {
+            return None;
+        }
+        let range = match self.sent {
+            0 => (200, 600),      // mimics HTTP request / small response
+            1 => (800, 1400),     // mimics HTTP response headers
+            _ => (500, 1400),     // mimics HTTP response body chunks
+        };
+        self.sent += 1;
+        let target = rand::thread_rng().gen_range(range.0..=range.1);
+        Some(target)
+    }
+}
+
+/// Parse inner framing header from a verified ApplicationData payload.
+/// Input: the bytes after HMAC tag (= inner_header + data + padding).
+/// Returns (cmd, data_slice) or None if malformed.
+pub(crate) fn parse_inner_frame(inner: &[u8]) -> Option<(u8, &[u8])> {
+    if inner.len() < INNER_HEADER_SIZE {
+        return None;
+    }
+    let cmd = inner[0];
+    let data_len = u16::from_be_bytes([inner[1], inner[2]]) as usize;
+    if inner.len() < INNER_HEADER_SIZE + data_len {
+        return None;
+    }
+    Some((cmd, &inner[INNER_HEADER_SIZE..INNER_HEADER_SIZE + data_len]))
+}
+
 #[inline]
+#[allow(dead_code)]
 pub(crate) fn xor_slice(data: &mut [u8], key: &[u8]) {
     data.iter_mut()
         .zip(key.iter().cycle())
@@ -173,6 +308,7 @@ pub(crate) fn xor_slice(data: &mut [u8], key: &[u8]) {
 }
 
 #[inline]
+#[allow(dead_code)]
 pub(crate) fn kdf(password: &str, server_random: &[u8]) -> Vec<u8> {
     let mut hasher = Sha256::new();
     hasher.update(password.as_bytes());
@@ -184,12 +320,12 @@ pub(crate) fn kdf(password: &str, server_random: &[u8]) -> Vec<u8> {
 pub(crate) async fn verified_relay(
     raw: TcpStream,
     tls: TcpStream,
-    mut hmac_add: Hmac,
-    mut hmac_verify: Hmac,
-    mut hmac_ignore: Option<Hmac>,
+    mut hmac_add: FrameHmac,
+    mut hmac_verify: FrameHmac,
     alert_enabled: bool,
+    auth_pending: bool,
 ) {
-    tracing::debug!("verified relay started");
+    tracing::debug!("verified relay started (auth_pending={auth_pending})");
     let (mut tls_read, mut tls_write) = tls.into_split();
     let (mut raw_read, mut raw_write) = raw.into_split();
     let (mut notfied, mut notifier) = local_sync::oneshot::channel::<()>();
@@ -199,8 +335,8 @@ pub(crate) async fn verified_relay(
                 &mut tls_read,
                 &mut raw_write,
                 &mut hmac_verify,
-                &mut hmac_ignore,
                 &mut notifier,
+                auth_pending,
             )
             .await;
             let _ = raw_write.shutdown().await;
@@ -236,19 +372,52 @@ pub(crate) fn bind_with_pretty_error<A: ToSocketAddrs>(
     })
 }
 
-/// Remove application data header, verify hmac, remove the
-/// hmac header and copy.
+/// State machine for receiving authenticated application data.
+///
+/// States:
+///   AuthPending → Authenticated (on first valid HMAC frame)
+///
+/// In AuthPending: non-HMAC ApplicationData frames (e.g., NewSessionTickets
+/// from handshake server drain) are silently discarded. FrameHmac's per-frame
+/// design means failed verifications do NOT corrupt state (seq stays unchanged).
+/// AuthPending has resource limits: max 64 KiB discarded and max 10 seconds.
+///
+/// In Authenticated: ALL ApplicationData frames must have valid HMAC.
+/// Any tag mismatch = immediate disconnect (strict seq policy, no reordering).
 async fn copy_remove_appdata_and_verify(
     read: impl AsyncReadRent,
     mut write: impl AsyncWriteRent,
-    hmac_verify: &mut Hmac,
-    hmac_ignore: &mut Option<Hmac>,
+    hmac_verify: &mut FrameHmac,
     alert_notifier: &mut Receiver<()>,
+    auth_pending: bool,
 ) {
+    /// Max bytes discarded during AuthPending before giving up.
+    const AUTH_PENDING_MAX_BYTES: usize = 64 * 1024;
+    /// Max time in AuthPending before giving up.
+    const AUTH_PENDING_MAX_SECS: u64 = 10;
     const INIT_BUFFER_SIZE: usize = 2048;
 
     let mut decoder = BufferFrameDecoder::new(read, INIT_BUFFER_SIZE);
+    let mut authenticated = !auth_pending;
+    let mut pending_bytes_discarded: usize = 0;
+    let auth_deadline = if auth_pending {
+        Some(std::time::Instant::now() + Duration::from_secs(AUTH_PENDING_MAX_SECS))
+    } else {
+        None
+    };
+
     loop {
+        // Check AuthPending time limit
+        if !authenticated {
+            if let Some(deadline) = auth_deadline {
+                if std::time::Instant::now() >= deadline {
+                    tracing::warn!("auth pending: time limit exceeded, disconnecting");
+                    alert_notifier.close();
+                    return;
+                }
+            }
+        }
+
         let maybe_frame = match decoder.next().await {
             Ok(f) => f,
             Err(e) => {
@@ -264,39 +433,87 @@ async fn copy_remove_appdata_and_verify(
                 return;
             }
         };
-        // validate frame
         match frame[0] {
             ALERT => {
                 return;
             }
             APPLICATION_DATA => {
-                if let Some(hi) = hmac_ignore.as_mut() {
-                    if verify_appdata(frame, hi, false) {
-                        // we can ignore the data
-                        tracing::debug!("useless data skipped");
+                if frame[1] != TLS_MAJOR
+                    || frame[2] != TLS_MINOR.0
+                    || frame.len() < TLS_HMAC_HEADER_SIZE
+                {
+                    if !authenticated {
+                        pending_bytes_discarded += frame.len();
+                        if pending_bytes_discarded > AUTH_PENDING_MAX_BYTES {
+                            tracing::warn!("auth pending: byte limit exceeded, disconnecting");
+                            alert_notifier.close();
+                            return;
+                        }
+                        tracing::debug!("auth pending: discarding non-conforming frame");
                         continue;
-                    } else {
-                        tracing::debug!("useless data detector disabled");
-                        hmac_ignore.take();
                     }
+                    alert_notifier.close();
+                    return;
                 }
 
-                if verify_appdata(frame, hmac_verify, true) {
-                    let (res, _) = write
-                        .write_all(unsafe {
-                            monoio::buf::RawBuf::new(
-                                frame.as_ptr().add(TLS_HMAC_HEADER_SIZE),
-                                frame.len() - TLS_HMAC_HEADER_SIZE,
-                            )
-                        })
-                        .await;
-                    if let Err(e) = res {
-                        tracing::error!("write data server failed: {e}");
+                let header = &frame[..TLS_HEADER_SIZE];
+                let payload = &frame[TLS_HMAC_HEADER_SIZE..];
+                let mut tag = [0u8; HMAC_SIZE];
+                tag.copy_from_slice(&frame[TLS_HEADER_SIZE..TLS_HMAC_HEADER_SIZE]);
+
+                if hmac_verify.verify_and_advance(header, payload, &tag) {
+                    if !authenticated {
+                        tracing::debug!("auth pending → authenticated (first valid HMAC frame)");
+                        authenticated = true;
+                    }
+                    // Parse inner framing: [cmd:1][data_len:2][data...][padding...]
+                    let inner = &frame[TLS_HMAC_HEADER_SIZE..];
+                    match parse_inner_frame(inner) {
+                        Some((CMD_DATA, data)) if !data.is_empty() => {
+                            let data_offset = TLS_HMAC_HEADER_SIZE + INNER_HEADER_SIZE;
+                            let data_len = data.len();
+                            let (res, _) = write
+                                .write_all(unsafe {
+                                    monoio::buf::RawBuf::new(
+                                        frame.as_ptr().add(data_offset),
+                                        data_len,
+                                    )
+                                })
+                                .await;
+                            if let Err(e) = res {
+                                tracing::error!("write data server failed: {e}");
+                                alert_notifier.close();
+                                return;
+                            }
+                        }
+                        Some((CMD_PADDING, _)) => {
+                            // Pure padding/waste frame, discard silently
+                            tracing::trace!("discarding padding frame");
+                        }
+                        Some((CMD_DATA, _)) => {
+                            // DATA with zero-length payload — skip
+                            tracing::trace!("discarding empty data frame");
+                        }
+                        _ => {
+                            tracing::warn!("malformed inner frame, disconnecting");
+                            alert_notifier.close();
+                            return;
+                        }
+                    }
+                } else if !authenticated {
+                    // AuthPending: discard non-HMAC frame (NewSessionTicket etc.)
+                    // FrameHmac seq is NOT advanced on failure, so state is clean.
+                    pending_bytes_discarded += frame.len();
+                    if pending_bytes_discarded > AUTH_PENDING_MAX_BYTES {
+                        tracing::warn!("auth pending: byte limit exceeded, disconnecting");
                         alert_notifier.close();
                         return;
                     }
+                    tracing::debug!("auth pending: discarding non-HMAC ApplicationData");
+                    continue;
                 } else {
-                    tracing::debug!("buffer hmac validate failed");
+                    // Strict seq policy: any tag error in Authenticated = disconnect.
+                    tracing::warn!("authenticated: HMAC verification failed (strict disconnect)");
                     alert_notifier.close();
                     return;
                 }
@@ -312,16 +529,19 @@ async fn copy_remove_appdata_and_verify(
 async fn copy_add_appdata(
     mut read: impl AsyncReadRent,
     mut write: impl AsyncWriteRent,
-    hmac: &mut Hmac,
+    hmac: &mut FrameHmac,
     alert_notified: &mut Sender<()>,
     alert_enabled: bool,
 ) {
-    const DEFAULT_DATA: [u8; TLS_HMAC_HEADER_SIZE] =
-        [APPLICATION_DATA, TLS_MAJOR, TLS_MINOR.0, 0, 0, 0, 0, 0, 0];
-
+    // Buffer layout: [TLS_HDR:5][HMAC:16][CMD:1][DATA_LEN:2][payload...][padding...]
     let mut buffer = Vec::with_capacity(COPY_BUF_SIZE);
-    buffer.extend_from_slice(&DEFAULT_DATA);
+    // Reserve space for TLS header + HMAC + inner header
+    buffer.resize(FRAME_OVERHEAD, 0);
+    buffer[0] = APPLICATION_DATA;
+    buffer[1] = TLS_MAJOR;
+    buffer[2] = TLS_MINOR.0;
 
+    let mut padding = PaddingState::new();
     let alert_notified = alert_notified.closed();
     let mut alert_notified = std::pin::pin!(alert_notified);
 
@@ -331,24 +551,47 @@ async fn copy_add_appdata(
                 send_alert(&mut write, alert_enabled).await;
                 return;
             },
-            (res, buf) = read.read(buffer.slice_mut(TLS_HMAC_HEADER_SIZE..)) => {
+            (res, buf) = read.read(buffer.slice_mut(FRAME_OVERHEAD..)) => {
                 if matches!(res, Ok(0) | Err(_)) {
                     send_alert(&mut write, alert_enabled).await;
                     return;
                 }
                 buffer = buf.into_inner();
+                let data_len = buffer.len() - FRAME_OVERHEAD;
+
+                // Write inner header: CMD_DATA + data_len
+                buffer[TLS_HMAC_HEADER_SIZE] = CMD_DATA;
+                buffer[TLS_HMAC_HEADER_SIZE + 1] = (data_len >> 8) as u8;
+                buffer[TLS_HMAC_HEADER_SIZE + 2] = data_len as u8;
+
+                // Add padding for first N packets
+                if let Some(target_payload) = padding.next_target_payload() {
+                    // target_payload = total TLS record payload (HMAC + inner_hdr + data + padding)
+                    let current_payload = HMAC_SIZE + INNER_HEADER_SIZE + data_len;
+                    if target_payload > current_payload {
+                        let pad_len = target_payload - current_payload;
+                        buffer.resize(buffer.len() + pad_len, 0);
+                        // Fill padding with random bytes
+                        rand::thread_rng().fill(&mut buffer[FRAME_OVERHEAD + data_len..]);
+                    }
+                }
+
+                // Write TLS record length
                 let frame_len = buffer.len() - TLS_HEADER_SIZE;
                 (&mut buffer[3..5])
                     .write_u16::<BigEndian>(frame_len as u16)
                     .unwrap();
 
-                hmac.update(&buffer[TLS_HMAC_HEADER_SIZE..]);
-                let hmac_val = hmac.finalize();
-                hmac.update(&hmac_val);
+                // Per-frame HMAC over inner content (cmd + data_len + data + padding)
+                let header = &[buffer[0], buffer[1], buffer[2], buffer[3], buffer[4]];
+                let hmac_val = hmac.tag_and_advance(header, &buffer[TLS_HMAC_HEADER_SIZE..]);
                 unsafe { copy_nonoverlapping(hmac_val.as_ptr(), buffer.as_mut_ptr().add(TLS_HEADER_SIZE), HMAC_SIZE) };
 
                 let (res, buf) = write.write_all(buffer).await;
                 buffer = buf;
+
+                // Reset buffer for next iteration
+                unsafe { buffer.set_len(FRAME_OVERHEAD) };
 
                 if res.is_err() {
                     return;
@@ -358,17 +601,6 @@ async fn copy_add_appdata(
     }
 }
 
-fn verify_appdata(frame: &[u8], hmac: &mut Hmac, sep: bool) -> bool {
-    if frame[1] != TLS_MAJOR || frame[2] != TLS_MINOR.0 || frame.len() < TLS_HMAC_HEADER_SIZE {
-        return false;
-    }
-    hmac.update(&frame[TLS_HMAC_HEADER_SIZE..]);
-    let hmac_real = hmac.finalize();
-    if sep {
-        hmac.update(&hmac_real);
-    }
-    frame[TLS_HEADER_SIZE..TLS_HEADER_SIZE + HMAC_SIZE] == hmac_real
-}
 
 async fn send_alert(mut w: impl AsyncWriteRent, alert_enabled: bool) {
     if !alert_enabled {

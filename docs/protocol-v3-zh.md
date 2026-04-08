@@ -1,7 +1,7 @@
 ---
 title: ShadowTLS V3 协议设计
 date: 2023-02-06 11:00:00
-updated: 2023-02-06 11:00:00
+updated: 2026-04-08 00:00:00
 author: ihciah
 ---
 
@@ -51,18 +51,76 @@ V3 协议在严格模式下仅支持使用 TLS1.3 的握手服务器。你可以
 2. 若 Client 假装数据解密成功，直接发送数据，由于存在数据帧校验，其也无法通过。
 
 # 数据封装
+
 V2 版本的数据封装协议事实上也无法抵御流量劫持，如中间人可能会在握手完成后对这部分数据做篡改，我们需要能够响应 Alert；中间人也可能会按照 V2 协议的样子将一个 ApplicationData 封装拆成两个，如果连接正常，则也可以用于识别协议。
 
 要应对流量劫持，除了要优化握手流程，数据封装部分也要重新设计。我们需要能够对数据流做验证，并且抵御重放、数据篡改、数据切分、数据乱序等攻击。
 
-数据除了最外层继续使用 ApplicationData 封装外，内层添加了 4 byte 的 HMAC 计算值。我们在使用 preshared key 创建 HMAC 实例后，会灌入 `ServerRandom+"C"` 或 `ServerRandom+"S"` 作为初始值，前者对应 Client 的发送数据流，后者对应 Server 的发送数据流（目的是防止中间人将我们发送的数据发回来，或者将不同连接的数据重放）。在转发过程中，首先将纯数据灌入 HMAC 实例，之后计算 4 byte 值后放于纯数据最前面。封装出的数据帧格式：(5B tls frame header)(4B HMAC)(data)。封装结束后将 4 byte 数据输入 HMAC 实例（避免中间人剪切拼接请求）。
+## 密钥派生
 
-当数据校验失败时，我们需要立刻发送 TLS Alert 正确关闭连接。在连接断开时也需要能够正确关闭。
+TLS 握手完成后，双方通过 ServerRandom 派生出方向独立的密钥，使用 **HKDF-SHA256**：
+
+```
+key_c2s = HKDF-SHA256(IKM=password, salt=ServerRandom, info="c2s")
+key_s2c = HKDF-SHA256(IKM=password, salt=ServerRandom, info="s2c")
+```
+
+每个密钥为 256 位。使用 ServerRandom 作为 HKDF 的 salt，将数据阶段密钥与具体 TLS 会话绑定，防止跨会话重放攻击。
+
+## 逐帧认证
+
+每个 ApplicationData 帧使用 **HMAC-SHA256**（截断至 16 字节）独立认证：
+
+```
+tag = HMAC-SHA256(key, seq_be32 || tls_header || inner_payload)[..16]
+```
+
+- `seq_be32`：32 位帧序号（大端序），从 0 开始，每方向每帧递增。序号绑定到 HMAC 输入，任何乱序或重放帧均会校验失败。
+- `tls_header`：5 字节 TLS 记录头（`type || major || minor || len_hi || len_lo`）。将记录头纳入 MAC，防止头部字段（如长度字段）被篡改。
+- `inner_payload`：HMAC tag 之后的帧体（内层头 + 数据 + 填充）。
+
+封装后的帧格式：
+
+```
+(5B TLS 记录头)(16B HMAC-SHA256 tag)(1B CMD)(2B DATA_LEN)(用户数据)(可选填充)
+```
+
+**严格序号策略**：连接完成首帧认证（Authenticated）后，任何后续 HMAC 校验失败均立即断开连接，不做重试。这消除了对序号计数器的预言攻击。
+
+**AuthPending 资源限制**：在等待第一个认证帧期间（如 NewSessionTicket 残留数据排空），不匹配的 ApplicationData 帧会被静默丢弃。该阶段有两个硬限制：累计丢弃字节不超过 64 KiB，且等待时间不超过 10 秒。超出任一限制则触发断开。
+
+## 内层帧（反 TLS-in-TLS）
+
+为防止内层协议流量特征（如 Shadowsocks 首包的固定长度）被统计分析检测，每个 ApplicationData payload 携带 3 字节内层头：
+
+```
+[CMD : 1 字节][DATA_LEN : 2 字节大端序][用户数据 : DATA_LEN 字节][填充 : 可变]
+```
+
+- `CMD = 0x01`（DATA）：帧携带 `DATA_LEN` 字节的真实用户数据，其后跟可变长度填充。接收方仅将 `DATA_LEN` 字节写入下游，丢弃填充部分。
+- `CMD = 0x00`（PADDING）：纯填充帧，接收方丢弃整个 payload。
+
+填充位于 HMAC 认证区域**内部**，因此填充内容与用户数据同等受到认证保护。
+
+### 填充策略
+
+每个方向的前 **8** 个数据包，发送方从贴近真实 HTTPS 流量分布的范围内随机选取目标 TLS 记录 payload 大小：
+
+| 包序号 | 目标 payload 范围 | 模拟的流量类型 |
+|---|---|---|
+| 0（首包） | 200 – 600 字节 | HTTP 请求 / 小型响应 |
+| 1 | 800 – 1 400 字节 | HTTP 响应头 |
+| 2 – 7 | 500 – 1 400 字节 | HTTP 响应体分块 |
+
+若实际用户数据已超过目标大小，则不添加填充（不截断数据）。第 8 包之后不再填充，直接使用原始数据长度。
 
 ## 安全性验证
-1. 对于中间人的数据篡改，HMAC 会直接验证出来，会响应 Alert。
-2. 对于中间人乱序攻击，HMAC 会直接验证出来，会响应 Alert。
-3. 对于剪切拼接攻击（合并两个 AppData），虽然 HMAC 处理的是数据流，但是由于我们在处理完成后又额外 update 进去一个 4 byte 的值，所以可以打断两个连续的流，防御这种攻击。
+
+1. 对于中间人数据篡改，逐帧 HMAC 会立即检测并通过 TLS Alert 关闭连接。
+2. 对于跨连接重放攻击，HKDF 派生密钥绑定了 `ServerRandom`，不同 TLS 会话密钥各不相同。
+3. 对于连接内部的重放或乱序攻击，HMAC 输入中的 32 位序号保证任何乱序帧均校验失败，触发严格断连。
+4. 对于头部篡改（如 TLS 记录长度字段），TLS 记录头被纳入 HMAC 输入，覆盖了这一攻击面。
+5. 对于 TLS-in-TLS 流量指纹检测，填充系统将前 8 个包的大小随机化到贴近真实 HTTPS 流量的范围，消除内层协议统计特征。
 
 # 实现指南
 ## 客户端
@@ -77,13 +135,14 @@ Stage1: TLS 握手
     2. 对 ApplicationData 使用 `HMAC_ServerRandom` 判定帧内容（不含 4byte HMAC）的 HMAC 与前 4 byte 是否匹配。若匹配则重写数据帧内容为其 XOR SHA256(PreSharedKey + ServerRandom)，并去掉前 4 byte HMAC 值。若不匹配则不做修改，并标记该连接被劫持，握手成功后发送糊弄性请求；握手失败则不做处理。
 
 Stage2: 数据转发（该过程不依赖 TLS 库）
-1. 创建 `HMAC_ServerRandomC` 和 `HMAC_ServerRandomS`。
-2. 读连接时 Parse Application Data 封装，并利用 `HMAC_ServerRandomS` 和 `HMAC_ServerRandom` 验证数据前 4 byte。
-    1. `HMAC_ServerRandom` 通过验证则表示这个是握手残留数据，直接忽略。
-    2. `HMAC_ServerRandomS` 通过验证则表示这个是我们自己的数据封装，此后禁用 `HMAC_ServerRandom` 分支判定，并将数据转发至用户（不含 HMAC）
-    3. 均未通过，则按照 Alert bad_record_mac 处理。
-    4. 说明：这里允许 Server 在 Client 完成切换后向 Client 发送残留的 TLS 帧，客户端需要负责过滤掉。因为 Server 并不强感知 TLS 握手结束，其仅感知 Client 发送切换后的数据。
-3. 写连接时添加 Application Data 与 HMAC，HMAC 通过 `HMAC_ServerRandomC` 计算得到。
+1. 使用 ServerRandom 作为 salt，通过 HKDF-SHA256 派生 `key_c2s` 和 `key_s2c`。
+2. 读取来自 Server 连接的 ApplicationData 帧，使用 `key_s2c` 和当前 `seq_s2c` 验证 16 字节 HMAC tag。
+    1. HMAC 通过（状态 = AuthPending）：切换至 Authenticated，解析内层帧，提取 `DATA_LEN` 字节的用户数据（丢弃填充），转发至用户。
+    2. HMAC 通过（状态 = Authenticated）：同上。纯填充帧（`CMD=0x00`）静默丢弃。
+    3. HMAC 失败（状态 = AuthPending）：可能为握手残留帧（NewSessionTicket 等），静默丢弃。适用资源限制（64 KiB / 10 秒）。
+    4. HMAC 失败（状态 = Authenticated）：严格断连——发送 TLS Alert 并关闭。
+    说明：Server 在 Client 完成切换后仍可能发送残留 TLS 帧，Client 在 AuthPending 阶段负责过滤。
+3. 向 Server 连接写入数据时，使用内层帧格式和 `key_c2s` 封装 ApplicationData 并递增 `seq_c2s`。对前 8 帧应用填充。
 
 ## 服务端
 服务端负责转发 TLS 握手、判定切换时机并在切换后做数据封装和解封装，它不依赖 TLS 库。
@@ -96,7 +155,7 @@ Stage1: 转发 TLS 握手
     2. ShadowTLS Client -> Handshake Server: 直接转发，直到遇到符合 ApplicationData 前 4 byte 符合 `HMAC_ServerRandomC` 签名结果的数据帧，此时停止双向转发（但需要保证残留正在发送中的帧的完整性）。
     3. Handshake Server -> ShadowTLS Client: 对 Application Data 帧做修改，对数据做 XOR SHA256(PreSharedKey + ServerRandom) 之后在头部添加 4 byte HMAC（由 `HMAC_ServerRandom` 计算）。
 
-Stage2: 数据转发(with Data Server)
-1. 创建 `HMAC_ServerRandomS`。
-2. ShadowTLS Client -> Data Server: Parse Application Data 封装，并利用 `HMAC_ServerRandomC` 验证数据前 4 byte。若未通过，则按照 Alert bad_record_mac 处理。验证完成后，将该 4 字节数据也输入到 `HMAC_ServerRandomC` 实例中。
-3. Data Server -> ShadowTLS Client: 添加 Application Data 与 HMAC，HMAC 通过 `HMAC_ServerRandomS` 计算得到。之后将该 4 字节数据也输入到 `HMAC_ServerRandomS` 实例中。
+Stage2: 数据转发（with Data Server）
+1. 使用 ServerRandom 作为 salt，通过 HKDF-SHA256 派生 `key_c2s` 和 `key_s2c`。
+2. ShadowTLS Client → Data Server：Parse ApplicationData 封装，使用 `key_c2s` 和 `seq_c2s` 验证 16 字节 HMAC tag。校验失败则按 Alert bad_record_mac 处理。校验成功后解析内层帧，提取真实用户数据（丢弃填充），转发至 Data Server。
+3. Data Server → ShadowTLS Client：使用内层帧格式和 `key_s2c` 封装 ApplicationData 并递增 `seq_s2c`。对前 8 帧应用填充。
