@@ -293,6 +293,10 @@ impl ShadowTlsServer {
         let mut frame_aead_c2s = FrameAead::new(&self.password, &server_random, b"c2s");
         let frame_aead_s2c = FrameAead::new(&self.password, &server_random, b"s2c");
 
+        // Pre-resolve data server address during handshake relay to save DNS latency.
+        // This overlaps DNS resolution with the handshake relay phase.
+        let data_addr = resolve(&self.target_addr).await?;
+
         // stage 1.3.2: copy ShadowTLS Client -> Handshake Server until hmac matches
         // stage 1.3.3: copy Handshake Server -> ShadowTLS Client verbatim (no modification)
         //
@@ -347,7 +351,7 @@ impl ShadowTlsServer {
 
         // stage 2.2: copy ShadowTLS Client -> Data Server
         // stage 2.3: copy Data Server -> ShadowTLS Client
-        let mut data_stream = TcpStream::connect_addr(resolve(&self.target_addr).await?).await?;
+        let mut data_stream = TcpStream::connect_addr(data_addr).await?;
         mod_tcp_conn(&mut data_stream, true, self.nodelay);
         let (res, _) = data_stream.write_all(pure_data).await;
         res?;
@@ -510,6 +514,8 @@ async fn copy_by_frame_until_aead_matches(
     let mut g_buffer = Vec::new();
     let mut aead_active = false;
     let mut forwarded_bytes: usize = 0;
+    // Pre-allocated decrypt buffer — reused across attempts to avoid per-frame allocation.
+    let mut decrypt_buf: Vec<u8> = Vec::with_capacity(16384);
 
     loop {
         // Enforce time budget
@@ -542,11 +548,12 @@ async fn copy_by_frame_until_aead_matches(
             tag.copy_from_slice(&buffer[TLS_HEADER_SIZE..TLS_HMAC_HEADER_SIZE]);
 
             // Always try to decrypt — don't latch on first match
-            let mut payload = buffer[TLS_HMAC_HEADER_SIZE..].to_vec();
-            if aead.decrypt_and_advance(&header, &mut payload, &tag) {
+            decrypt_buf.clear();
+            decrypt_buf.extend_from_slice(&buffer[TLS_HMAC_HEADER_SIZE..]);
+            if aead.decrypt_and_advance(&header, &mut decrypt_buf, &tag) {
                 aead_active = true;
                 // Parse inner framing from decrypted plaintext
-                match crate::util::parse_inner_frame(&payload) {
+                match crate::util::parse_inner_frame(&decrypt_buf) {
                     Some((CMD_DATA, data)) if !data.is_empty() => {
                         return Ok(data.to_vec());
                     }
@@ -605,8 +612,12 @@ async fn copy_by_frame_verbatim(
     stop: &mut Sender<()>,
 ) -> std::io::Result<()> {
     /// Idle timeout for drain relay: if no frame arrives within this duration,
-    /// assume the connection is half-dead and stop.
-    const DRAIN_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+    /// assume the connection is half-dead and stop. Reduced from 30s to 5s:
+    /// the handshake server typically sends NewSessionTickets + alert within
+    /// 1-2 RTTs after receiving the client's Finished (~200ms max for remote
+    /// servers). 5s is generous enough for any server while minimizing the
+    /// delay before data phase starts in edge cases.
+    const DRAIN_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
     let mut g_buffer = Vec::new();
     let stop = stop.closed();

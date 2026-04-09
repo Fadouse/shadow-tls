@@ -67,7 +67,7 @@ Client (boring)          Shadow-TLS Server          Handshake Server
 
 1. **ClientHello**: boring generates it; we save the original session_id, patch it with HMAC, and send.
 2. **ServerHello**: restore original session_id (boring verifies the echo), extract ServerRandom, feed to boring.
-3. **Client flight**: boring writes CCS. It then attempts to decrypt the server's encrypted extensions, which fails with BAD_DECRYPT (expected — different transcript hash). A random ApplicationData record is appended as synthetic Finished.
+3. **Client flight**: boring writes CCS. It then attempts to decrypt the server's encrypted extensions, which fails with BAD_DECRYPT (expected — different transcript hash). An ApplicationData record matching the exact size of a real encrypted Finished (53 bytes for SHA-256 ciphers, 69 bytes for SHA-384 ciphers) is appended as synthetic Finished.
 4. **Data phase**: both sides derive AEAD keys from ServerRandom and begin authenticated relay.
 
 ### HelloRetryRequest (HRR)
@@ -150,9 +150,9 @@ Each encrypted payload carries a 3-byte inner header to prevent statistical fing
 | 1 | 800 – 1400 B (5%: 14000 – 16000) | HTTP headers / large file |
 | 2–7 | 500 – 1400 B (5%: 14000 – 16000) | HTTP body chunks / large file |
 
-**Phase 2 — Tail padding (packets 8+):**
+**Phase 2 — Tail padding (packets N+, where N is randomized per-connection in [5, 13]):**
 
-Each frame has a **2% probability** of 0–256 bytes of random padding, eliminating the abrupt statistical transition at the packet-8 boundary.
+Each frame has a **5% probability** of 0–512 bytes of random padding, eliminating the abrupt statistical transition. The transition point N is randomized per-connection to prevent cross-connection fingerprinting of a fixed boundary.
 
 # Security Properties
 

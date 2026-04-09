@@ -67,7 +67,7 @@ HMAC 计算范围为 ClientHello 记录体（不含 5 字节 TLS 头），计算
 
 1. **ClientHello**：boring 生成；保存原始 session_id，补丁 HMAC 后发送。
 2. **ServerHello**：恢复原始 session_id（boring 验证回显），提取 ServerRandom，喂给 boring。
-3. **客户端飞行**：boring 写出 CCS，尝试解密服务端加密扩展，BAD_DECRYPT 失败（预期——不同转录哈希）。追加随机 ApplicationData 作为合成 Finished。
+3. **客户端飞行**：boring 写出 CCS，尝试解密服务端加密扩展，BAD_DECRYPT 失败（预期——不同转录哈希）。追加精确匹配真实 TLS 1.3 加密 Finished 大小（SHA-256 套件 53 字节，SHA-384 套件 69 字节）的 ApplicationData 记录作为合成 Finished。
 4. **数据阶段**：双方从 ServerRandom 派生 AEAD 密钥，开始认证中继。
 
 ### HelloRetryRequest（HRR）
@@ -150,9 +150,9 @@ ciphertext || tag = AES-128-GCM(key, nonce, AAD=tls_header, plaintext)
 | 1 | 800 – 1400 B（5%: 14000 – 16000） | HTTP 响应头 / 大文件 |
 | 2–7 | 500 – 1400 B（5%: 14000 – 16000） | HTTP 响应体 / 大文件 |
 
-**阶段 2 — 尾部填充（第 8 包及以后）：**
+**阶段 2 — 尾部填充（第 N 包及以后，N 为每连接随机值，范围 [5, 13]）：**
 
-每帧 **2% 概率**追加 0–256 字节随机填充，消除第 8 包边界处的统计突变。
+每帧 **5% 概率**追加 0–512 字节随机填充，消除统计突变。过渡点 N 每连接随机化，防止跨连接指纹识别固定边界。
 
 # 安全特性
 
@@ -186,7 +186,7 @@ ciphertext || tag = AES-128-GCM(key, nonce, AAD=tls_header, plaintext)
 1. BoringSSL 生成 ClientHello，保存原始 session_id，补丁 HMAC 后发送。
 2. 读取 ServerHello（检测到合成随机值则处理 HRR），恢复 session_id，提取 ServerRandom。
 3. 通过 BoringSSL 继续握手直到产生客户端飞行。
-4. TLS 1.3：追加随机 ApplicationData 作为合成 Finished。
+4. TLS 1.3：追加精确匹配真实加密 Finished 大小的 ApplicationData 作为合成 Finished（根据协商密码套件选择 53 或 69 字节）。
 5. 发送客户端飞行。TLS 1.2：发送伪造请求后终止。
 
 **Stage 2 — 数据中继（无需 TLS 库）：**

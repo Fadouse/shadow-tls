@@ -57,8 +57,6 @@ pub(crate) mod prelude {
     pub(crate) const CMD_DATA: u8 = 0x01;
     /// Inner command: padding/waste (receiver discards).
     pub(crate) const CMD_PADDING: u8 = 0x00;
-    /// Number of initial data packets to pad.
-    pub(crate) const PADDING_COUNT: usize = 8;
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -290,39 +288,54 @@ impl FrameAead {
 
 /// Padding state for anti TLS-in-TLS with realistic traffic distribution.
 ///
-/// Three phases:
-///   1. Packet 0: mimics HTTP request / small response (200-600 bytes)
-///   2. Packets 1-7: mimics HTTP response with small probability of full-size frames
-///      (like real HTTPS large file downloads that produce ~16KB TLS records)
-///   3. Packet 8+: low-probability (2%) random padding of 0-256 bytes on any frame,
-///      eliminating the abrupt feature change at packet boundary.
+/// Key improvements over naive fixed-boundary padding:
+///   1. **Randomized transition point**: the boundary between mandatory and
+///      probabilistic padding is randomized per-connection (range 5-13),
+///      preventing statistical fingerprinting of a fixed packet boundary.
+///   2. **Realistic traffic distribution**: mimics real HTTPS (HTTP/2) traffic
+///      patterns with variable frame sizes.
+///   3. **Higher tail padding**: 5% probability of 0-512B random padding after
+///      the initial phase, smoothing the statistical transition.
 pub(crate) struct PaddingState {
     sent: usize,
+    /// Per-connection randomized transition point from mandatory to probabilistic padding.
+    transition_point: usize,
 }
 
-/// Probability (out of 100) that packets 2-7 produce a near-full-size frame.
+/// Probability (out of 100) that initial-phase packets produce a near-full-size frame.
 const FULL_FRAME_PROBABILITY: u32 = 5;
 /// Near-full-size range when triggered (mimics large HTTPS response body).
 const FULL_FRAME_RANGE: (usize, usize) = (14000, 16000);
 /// Probability (out of 100) of post-initial-phase random padding.
-const TAIL_PADDING_PROBABILITY: u32 = 2;
+const TAIL_PADDING_PROBABILITY: u32 = 5;
 /// Max tail padding bytes.
-const TAIL_PADDING_MAX: usize = 256;
+const TAIL_PADDING_MAX: usize = 512;
 
 impl PaddingState {
     pub(crate) fn new() -> Self {
-        Self { sent: 0 }
+        let mut rng = rand::thread_rng();
+        // Randomize transition point: sum of three small uniforms gives a
+        // roughly bell-shaped distribution centered around 9, range [5, 13].
+        // This eliminates the fixed-boundary fingerprint that an observer
+        // could detect across multiple connections.
+        let transition_point = 5 + rng.gen_range(0..=3u32) as usize
+            + rng.gen_range(0..=3u32) as usize
+            + rng.gen_range(0..=2u32) as usize;
+        Self {
+            sent: 0,
+            transition_point,
+        }
     }
 
     /// Returns the number of padding bytes to append for the current packet.
     /// `current_payload` = tag + inner header + data (before padding).
     ///
-    /// For the first 8 packets: pads to a target payload size (mandatory).
-    /// After that: 2% chance of 0-256B extra padding (smooths the cutoff).
+    /// During initial phase: pads to a target payload size (mandatory).
+    /// After transition: 5% chance of 0-512B extra padding (smooths the cutoff).
     pub(crate) fn next_padding_len(&mut self, current_payload: usize) -> usize {
         let mut rng = rand::thread_rng();
 
-        if self.sent < PADDING_COUNT {
+        if self.sent < self.transition_point {
             let range = match self.sent {
                 0 => (200, 600), // HTTP request / small response
                 1 => {
@@ -347,8 +360,9 @@ impl PaddingState {
             let target = rng.gen_range(range.0..=range.1);
             target.saturating_sub(current_payload)
         } else {
-            // Post-initial phase: low-probability tail padding (2%)
-            // Adds 0-256 random bytes to eliminate the abrupt cutoff at packet 9.
+            // Post-initial phase: probabilistic tail padding (5%).
+            // Higher probability and wider range than before to better smooth
+            // the statistical transition and resist traffic analysis.
             self.sent += 1;
             if rng.gen_range(0..100u32) < TAIL_PADDING_PROBABILITY {
                 rng.gen_range(0..=TAIL_PADDING_MAX)
@@ -457,6 +471,8 @@ async fn copy_remove_appdata_and_decrypt(
     let mut decoder = BufferFrameDecoder::new(read, INIT_BUFFER_SIZE);
     let mut authenticated = !auth_pending;
     let mut pending_bytes_discarded: usize = 0;
+    // Pre-allocated decrypt buffer — reused across frames to avoid per-frame allocation.
+    let mut decrypt_buf: Vec<u8> = Vec::with_capacity(16384);
     let auth_deadline = if auth_pending {
         Some(std::time::Instant::now() + Duration::from_secs(AUTH_PENDING_MAX_SECS))
     } else {
@@ -566,23 +582,24 @@ async fn copy_remove_appdata_and_decrypt(
                 let mut tag = [0u8; HMAC_SIZE];
                 tag.copy_from_slice(&frame[TLS_HEADER_SIZE..TLS_HMAC_HEADER_SIZE]);
 
-                // Decrypt in-place: copy ciphertext to a mutable buffer
-                let mut payload = frame[TLS_HMAC_HEADER_SIZE..].to_vec();
+                // Decrypt using reusable buffer (avoids per-frame allocation)
+                decrypt_buf.clear();
+                decrypt_buf.extend_from_slice(&frame[TLS_HMAC_HEADER_SIZE..]);
 
-                if aead.decrypt_and_advance(&header, &mut payload, &tag) {
+                if aead.decrypt_and_advance(&header, &mut decrypt_buf, &tag) {
                     if !authenticated {
                         tracing::debug!("auth pending → authenticated (first valid GCM frame)");
                         authenticated = true;
                     }
                     // Parse inner framing from decrypted plaintext
-                    match parse_inner_frame(&payload) {
+                    match parse_inner_frame(&decrypt_buf) {
                         Some((CMD_DATA, data)) if !data.is_empty() => {
                             let data_offset = INNER_HEADER_SIZE;
                             let data_len = data.len();
                             let (res, _) = write
                                 .write_all(unsafe {
                                     monoio::buf::RawBuf::new(
-                                        payload.as_ptr().add(data_offset),
+                                        decrypt_buf.as_ptr().add(data_offset),
                                         data_len,
                                     )
                                 })
@@ -647,7 +664,10 @@ async fn copy_remove_appdata_and_decrypt(
 }
 
 /// Buffer capacity for encrypt-and-send frames.
-const ENCRYPT_BUF_SIZE: usize = 16384 + FRAME_OVERHEAD;
+/// Sized to fit max data (16384) + framing overhead + worst-case initial padding (16000)
+/// without reallocation. Previous value (16384 + 24) caused reallocation on every
+/// padded frame during the initial phase.
+const ENCRYPT_BUF_SIZE: usize = 16384 + FRAME_OVERHEAD + 16384;
 
 async fn copy_add_appdata_and_encrypt(
     mut read: impl AsyncReadRent,

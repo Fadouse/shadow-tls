@@ -13,6 +13,43 @@ use std::time::Duration;
 use crate::util::prelude::*;
 use crate::util::Hmac;
 
+// ---------------------------------------------------------------------------
+// TLS 1.3 Cipher Suite Classification
+// ---------------------------------------------------------------------------
+
+/// TLS 1.3 cipher suite type — determines the correct Finished record size.
+#[derive(Copy, Clone, Debug)]
+pub(crate) enum Tls13Cipher {
+    /// TLS_AES_128_GCM_SHA256 (0x1301) — verify_data = 32 bytes
+    Aes128GcmSha256,
+    /// TLS_AES_256_GCM_SHA384 (0x1302) — verify_data = 48 bytes
+    Aes256GcmSha384,
+    /// TLS_CHACHA20_POLY1305_SHA256 (0x1303) — verify_data = 32 bytes
+    Chacha20Poly1305Sha256,
+}
+
+impl Tls13Cipher {
+    /// Encrypted Finished record body length in TLS 1.3.
+    ///
+    /// Layout: Handshake header(4) + verify_data(32|48) + content_type(1) + AEAD tag(16)
+    ///   SHA-256 ciphers: 4 + 32 + 1 + 16 = 53
+    ///   SHA-384 ciphers: 4 + 48 + 1 + 16 = 69
+    fn finished_record_body_len(self) -> usize {
+        match self {
+            Self::Aes256GcmSha384 => 69,
+            _ => 53,
+        }
+    }
+
+    fn from_cipher_suite(cs: u16) -> Self {
+        match cs {
+            0x1302 => Self::Aes256GcmSha384,
+            0x1303 => Self::Chacha20Poly1305Sha256,
+            _ => Self::Aes128GcmSha256,
+        }
+    }
+}
+
 /// Overall timeout for the entire handshake phase.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -294,6 +331,23 @@ fn extract_server_random_raw(frame: &[u8]) -> Option<[u8; TLS_RANDOM_SIZE]> {
     Some(sr)
 }
 
+/// Extract the negotiated cipher suite from a raw ServerHello frame.
+///
+/// ServerHello layout after TLS header:
+///   HandshakeType(1) + Length(3) + ProtocolVersion(2) + Random(32) + SessionIDLen(1) + SessionID(var) + CipherSuite(2)
+fn extract_cipher_suite_raw(frame: &[u8]) -> Tls13Cipher {
+    if frame.len() > SESSION_ID_LEN_IDX {
+        let sid_len = frame[SESSION_ID_LEN_IDX] as usize;
+        let cs_offset = SESSION_ID_LEN_IDX + 1 + sid_len;
+        if frame.len() >= cs_offset + 2 {
+            let cs = u16::from_be_bytes([frame[cs_offset], frame[cs_offset + 1]]);
+            return Tls13Cipher::from_cipher_suite(cs);
+        }
+    }
+    // Default to the most common cipher suite
+    Tls13Cipher::Aes128GcmSha256
+}
+
 /// Read exactly one TLS record from TCP with a timeout.
 async fn read_tls_frame_timeout(tcp: &mut TcpStream, timeout: Duration) -> io::Result<Vec<u8>> {
     match monoio::time::timeout(timeout, read_tls_frame(tcp)).await {
@@ -344,8 +398,15 @@ fn contains_application_data(data: &[u8]) -> bool {
 }
 
 /// Append a random ApplicationData record simulating an encrypted Finished.
-fn append_random_finished(data: &mut Vec<u8>) {
-    let payload_len: usize = 36 + (rand::random::<usize>() % 16);
+///
+/// Uses the EXACT record body length of a real TLS 1.3 encrypted Finished:
+///   53 bytes for SHA-256 ciphers (AES_128_GCM, CHACHA20_POLY1305)
+///   69 bytes for SHA-384 ciphers (AES_256_GCM)
+///
+/// Previous implementation used random 36-51 bytes which is a trivially
+/// detectable fingerprint — real Finished is NEVER that size.
+fn append_random_finished(data: &mut Vec<u8>, cipher: Tls13Cipher) {
+    let payload_len = cipher.finished_record_body_len();
     let start = data.len();
     data.resize(start + TLS_HEADER_SIZE + payload_len, 0);
     data[start] = APPLICATION_DATA;
@@ -473,7 +534,8 @@ pub(crate) async fn perform_v3_handshake(
     }
 
     let tls13 = crate::util::support_tls13(&server_hello);
-    tracing::debug!("ServerHello received (tls1.3={tls13})");
+    let cipher = extract_cipher_suite_raw(&server_hello);
+    tracing::debug!("ServerHello received (tls1.3={tls13}, cipher={cipher:?})");
 
     // Phase 6: Continue handshake — feed server frames, collect client flight
     let mut client_flight = Vec::new();
@@ -534,32 +596,39 @@ pub(crate) async fn perform_v3_handshake(
                 let err = fail_mid.error();
                 let err_str = format!("{err}");
 
-                if tls13 && client_flight_flushed > 0 {
+                if tls13 {
                     // Expected for TLS 1.3: BAD_DECRYPT when boring tries to
                     // decrypt server's encrypted flight (different transcript hash).
-                    // We verify boring progressed far enough to send CCS
-                    // (client_flight_flushed > 0) — if it failed before producing
-                    // any output, it's a genuine error (bad params, client-auth, etc).
+                    //
+                    // Accept the error if EITHER:
+                    //   1. boring already flushed output (CCS) in the main loop, OR
+                    //   2. the error is a decrypt/MAC error (always expected in TLS 1.3)
+                    //
+                    // Case 2 is needed for HelloRetryRequest flows: boring may have
+                    // flushed CCS during HRR handling (before client_flight_flushed
+                    // tracking), so client_flight_flushed can be 0 even though the
+                    // handshake progressed correctly.
                     let err_lower = err_str.to_lowercase();
                     let is_decrypt_error = err_lower.contains("decrypt")
                         || err_lower.contains("bad_record_mac")
                         || err_lower.contains("mac");
-                    if !is_decrypt_error {
-                        tracing::warn!(
-                            "TLS 1.3: non-decrypt failure after CCS ({client_flight_flushed} bytes flushed): {err_str}"
+                    if is_decrypt_error || client_flight_flushed > 0 {
+                        if !is_decrypt_error {
+                            tracing::warn!(
+                                "TLS 1.3: non-decrypt failure after CCS ({client_flight_flushed} bytes flushed): {err_str}"
+                            );
+                        }
+                        tracing::debug!(
+                            "boring handshake terminated (expected for TLS 1.3): {err_str}"
                         );
+                        completed = true;
+                        break;
                     }
-                    tracing::debug!(
-                        "boring handshake terminated (expected for TLS 1.3): {err_str}"
-                    );
-                    completed = true;
-                    break;
-                } else {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        format!("TLS handshake failure: {err_str}"),
-                    ));
                 }
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("TLS handshake failure: {err_str}"),
+                ));
             }
             Err(HandshakeError::SetupFailure(e)) => {
                 return Err(io::Error::new(io::ErrorKind::Other, format!("TLS setup failure: {e}")));
@@ -574,9 +643,9 @@ pub(crate) async fn perform_v3_handshake(
         ));
     }
 
-    // Phase 7: TLS 1.3 — append random ApplicationData as synthetic Finished
+    // Phase 7: TLS 1.3 — append ApplicationData matching real encrypted Finished size
     if tls13 && !contains_application_data(&client_flight) {
-        append_random_finished(&mut client_flight);
+        append_random_finished(&mut client_flight, cipher);
     }
 
     // Phase 8: Send client flight
