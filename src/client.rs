@@ -172,7 +172,10 @@ impl ShadowTlsClient {
                     let client = shared.clone();
                     mod_tcp_conn(&mut conn, true, shared.nodelay);
                     monoio::spawn(async move {
-                        let _ = client.relay(conn).await;
+                        match client.relay(conn).await {
+                            Ok(()) => {}
+                            Err(e) => tracing::warn!("Relay error for {addr}: {e:#}"),
+                        }
                         tracing::info!("Relay for {addr} finished");
                     });
                 }
@@ -200,11 +203,13 @@ impl ShadowTlsClient {
                 .await?;
 
         if !tls13 {
-            tracing::warn!("TLS 1.3 is not supported by server, sending fake request");
-            boring_tls::perform_fake_request(&mut stream, &self.ssl_connector, sni).await?;
-            bail!("TLS 1.3 is not supported, fake request sent");
+            tracing::warn!("TLS 1.3 not supported, sending fake request and aborting");
+            boring_tls::fake_request_and_drain(&mut stream, sni).await?;
+            bail!("TLS 1.3 is not supported");
         }
 
+        // Client flight (CCS + encrypted Finished) was already sent by
+        // perform_v3_handshake using boring's authentic TLS output.
         tracing::debug!("Authorized, ServerRandom extracted: {server_random:?}");
         let frame_aead_c2s = FrameAead::new(&self.password, &server_random, b"c2s");
         let frame_aead_s2c = FrameAead::new(&self.password, &server_random, b"s2c");

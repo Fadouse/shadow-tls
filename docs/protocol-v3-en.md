@@ -97,9 +97,18 @@ The encapsulated frame format is:
 
 **AuthPending resource limits**: while waiting for the first authenticated frame (e.g., during NewSessionTicket drain), non-matching ApplicationData frames are discarded silently. This state has two hard limits: 64 KiB of discarded bytes and 10 seconds of elapsed time. Exceeding either limit triggers disconnection.
 
-## Frame Coalescing
+## BoringSSL-Driven Handshake Continuation
 
-When the sender reads a small amount of data from the upstream, it attempts a second read to coalesce more data into a single TLS record (up to ~16 KB). This reduces the number of AES-GCM operations and TLS records for small-packet workloads (e.g., web browsing), improving throughput without adding latency for large transfers.
+The client uses BoringSSL not only to generate the initial ClientHello, but also to drive the subsequent handshake, producing authentic TLS client flight records:
+
+1. **ClientHello generation**: boring generates the ClientHello; the original session_id is saved before HMAC patching.
+2. **ServerHello processing**: The handshake server's ServerHello is modified to restore the original session_id (boring verifies the echoed session_id), then fed back to boring for continued processing.
+3. **Client flight production**:
+   - **TLS 1.3**: boring processes ServerHello → writes real CCS → reads server CCS → attempts to decrypt the encrypted flight → fails with BAD_DECRYPT (expected: different transcript hash due to patched session_id). A random ApplicationData record is appended to simulate the encrypted Finished (indistinguishable from real encrypted data to any observer without keys).
+   - **TLS 1.2**: boring processes ServerHello → Certificate → ServerKeyExchange → ServerHelloDone → writes authentic ClientKeyExchange + CCS + encrypted Finished. The Finished hash is incorrect (different transcript), but the wire traffic is 100% authentic BoringSSL output with real ECDHE key exchange parameters.
+4. **Alert race safety**: The handshake server rejects the incorrect Finished and sends a fatal alert, but this requires a full network round trip (50–200 ms). The shadow-tls server's AEAD match happens locally in microseconds (the AEAD frame immediately follows the client flight in the TCP stream), so the handshake relay terminates before the alert arrives. The alert is never forwarded to the client.
+
+Certificate verification is disabled in the boring SSL context (we only use boring for authentic record generation, not security validation), allowing it to process any server's certificate chain without trusted CA requirements.
 
 ## Inner Framing (Anti TLS-in-TLS)
 
@@ -189,7 +198,7 @@ Stage2: Data forwarding (this process does not rely on TLS library)
     3. If GCM fails (state = AuthPending): this may be a residual handshake frame (NewSessionTicket etc.); discard silently. Resource limits apply (64 KiB / 10 s).
     4. If GCM fails (state = Authenticated): strict disconnect — send TLS Alert and close.
     Note: The Server is allowed to send residual TLS frames after the Client has switched; the Client filters them during the AuthPending state.
-3. When writing to the server connection, build the inner frame (CMD + DATA_LEN + data + padding), encrypt with AES-128-GCM using `key_c2s` and `base_nonce XOR seq_be64`, wrap in ApplicationData with the GCM tag. Apply two-phase padding. Use frame coalescing for small reads.
+3. When writing to the server connection, build the inner frame (CMD + DATA_LEN + data + padding), encrypt with AES-128-GCM using `key_c2s` and `base_nonce XOR seq_be64`, wrap in ApplicationData with the GCM tag. Apply two-phase padding.
 
 ## Server-side
 The server is responsible for forwarding the TLS handshake, determining the timing of the switch, and encapsulating and decapsulating the data after the switch, without relying on the TLS library.
@@ -205,4 +214,4 @@ Start two-way forwarding (with Handshake Server).
 Stage2: Data forwarding (with Data Server)
 1. Derive `key_c2s` and `key_s2c` via HKDF-SHA256 using ServerRandom as salt (28 bytes each: 16-byte AES key + 12-byte base nonce).
 2. ShadowTLS Client → Data Server: Parse ApplicationData, extract 16-byte GCM tag, decrypt ciphertext using `key_c2s` and `base_nonce XOR seq_be64`. Any authentication failure is treated as Alert bad_record_mac. On success, parse the decrypted inner frame, extract the real user data bytes (discarding padding), and forward to the Data Server.
-3. Data Server → ShadowTLS Client: Build inner frame, encrypt with AES-128-GCM using `key_s2c`, wrap in ApplicationData with GCM tag. Apply two-phase padding to all frames. Use frame coalescing for small reads.
+3. Data Server → ShadowTLS Client: Build inner frame, encrypt with AES-128-GCM using `key_s2c`, wrap in ApplicationData with GCM tag. Apply two-phase padding to all frames.

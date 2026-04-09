@@ -1,14 +1,13 @@
-use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 
 use boring::ssl::{
     HandshakeError, MidHandshakeSslStream, SslConnector, SslConnectorBuilder, SslMethod,
-    SslStream, SslVersion,
+    SslVerifyMode, SslVersion,
 };
-use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
+use monoio::buf::IoBufMut;
+use monoio::io::{AsyncReadRentExt, AsyncWriteRentExt};
 use monoio::net::TcpStream;
 use rand::Rng;
-use tracing;
 
 use crate::util::prelude::*;
 use crate::util::Hmac;
@@ -40,8 +39,6 @@ pub(crate) fn build_chrome_ssl_connector(
     )?;
 
     // --- Key exchange groups: X25519Kyber768 (post-quantum!) + X25519 + P-256 + P-384 ---
-    // X25519Kyber768 is the critical addition: Chrome sends a ~1200-byte key share.
-    // Without it, the ClientHello is ~1000 bytes shorter than real Chrome.
     builder.set_curves_list("X25519Kyber768Draft00:X25519:P-256:P-384")?;
 
     // --- Signature algorithms matching Chrome ---
@@ -52,7 +49,6 @@ pub(crate) fn build_chrome_ssl_connector(
 
     // --- ALPN: h2 + http/1.1 (Chrome default) ---
     let alpn_wire = if alpn.is_empty() {
-        // Default Chrome ALPN
         b"\x02h2\x08http/1.1".to_vec()
     } else {
         let mut wire = Vec::new();
@@ -72,62 +68,56 @@ pub(crate) fn build_chrome_ssl_connector(
 }
 
 // ---------------------------------------------------------------------------
-// SyncBridge: in-memory buffer pair for driving boring's sync I/O from async
+// SyncBridge: in-memory buffer pair for boring's sync I/O
 // ---------------------------------------------------------------------------
 
-/// An in-memory buffer pair that implements `Read + Write` for boring's SslStream.
+/// Bidirectional sync I/O buffer for boring's SslStream.
 ///
-/// The async handshake driver pumps data between this bridge and the real TcpStream.
-/// boring writes outgoing TLS data to `write_buf`, we flush it to TCP asynchronously.
-/// We read from TCP asynchronously into `read_buf`, boring reads from it synchronously.
+/// - `write_buf`: captures bytes boring wants to send (ClientHello, CCS, Finished, etc.)
+/// - `read_buf`: provides server bytes for boring to process (ServerHello, Certificate, etc.)
+///
+/// Returns `WouldBlock` when `read_buf` is exhausted, signaling boring to yield
+/// control so we can read more frames from TCP.
 struct SyncBridge {
-    /// Data from network, consumed by SSL (network → SSL)
-    read_buf: VecDeque<u8>,
-    /// Data from SSL, to be sent to network (SSL → network)
+    read_buf: Vec<u8>,
+    read_pos: usize,
     write_buf: Vec<u8>,
 }
 
 impl SyncBridge {
     fn new() -> Self {
         Self {
-            read_buf: VecDeque::with_capacity(16384),
+            read_buf: Vec::new(),
+            read_pos: 0,
             write_buf: Vec::with_capacity(4096),
         }
     }
 
-    /// Feed data from the network into the read buffer.
-    fn feed_read(&mut self, data: &[u8]) {
-        self.read_buf.extend(data);
+    /// Feed server data for boring to read.
+    fn feed(&mut self, data: &[u8]) {
+        if self.read_pos == self.read_buf.len() {
+            self.read_buf.clear();
+            self.read_pos = 0;
+        }
+        self.read_buf.extend_from_slice(data);
     }
 
-    /// Take all pending write data (SSL → network).
+    /// Take all bytes boring has written (client flight records).
     fn take_write_buf(&mut self) -> Vec<u8> {
-        std::mem::replace(&mut self.write_buf, Vec::with_capacity(4096))
-    }
-
-    /// Check if there's pending data to write to the network.
-    fn has_pending_write(&self) -> bool {
-        !self.write_buf.is_empty()
+        std::mem::take(&mut self.write_buf)
     }
 }
 
 impl Read for SyncBridge {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if self.read_buf.is_empty() {
+        let available = self.read_buf.len() - self.read_pos;
+        if available == 0 {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "need more data"));
         }
-        let (front, back) = self.read_buf.as_slices();
-        let n = buf.len().min(front.len());
-        if n > 0 {
-            buf[..n].copy_from_slice(&front[..n]);
-            self.read_buf.drain(..n);
-            Ok(n)
-        } else {
-            let n = buf.len().min(back.len());
-            buf[..n].copy_from_slice(&back[..n]);
-            self.read_buf.drain(..n);
-            Ok(n)
-        }
+        let n = buf.len().min(available);
+        buf[..n].copy_from_slice(&self.read_buf[self.read_pos..self.read_pos + n]);
+        self.read_pos += n;
+        Ok(n)
     }
 }
 
@@ -143,311 +133,418 @@ impl Write for SyncBridge {
 }
 
 // ---------------------------------------------------------------------------
-// Session ID Patching
+// Handshake Initiation
 // ---------------------------------------------------------------------------
+
+/// Start a TLS handshake with boring, producing the ClientHello and returning
+/// the mid-handshake stream for continuation.
+///
+/// Certificate verification is disabled — we use boring only for generating
+/// authentic TLS records, not for security validation. This allows boring to
+/// process the server's Certificate without failing on untrusted CAs.
+fn start_handshake(
+    connector: &SslConnector,
+    sni: &str,
+) -> io::Result<(MidHandshakeSslStream<SyncBridge>, Vec<u8>)> {
+    let bridge = SyncBridge::new();
+    let mut ssl = connector
+        .configure()
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("SSL configure: {e}")))?
+        .into_ssl(sni)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("SSL create: {e}")))?;
+
+    // Disable cert verification — we only need authentic TLS record generation.
+    ssl.set_verify(SslVerifyMode::NONE);
+
+    let mut builder = boring::ssl::SslStreamBuilder::new(ssl, bridge);
+    builder.set_connect_state();
+
+    match builder.handshake() {
+        Err(HandshakeError::WouldBlock(mut mid)) => {
+            let client_hello = mid.get_mut().take_write_buf();
+            Ok((mid, client_hello))
+        }
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::Other,
+            "handshake completed unexpectedly with empty bridge",
+        )),
+        Err(HandshakeError::Failure(mid)) => Err(io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            format!("ClientHello generation failed: {}", mid.error()),
+        )),
+        Err(HandshakeError::SetupFailure(e)) => Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("TLS setup failed: {e}"),
+        )),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Session ID Operations
+// ---------------------------------------------------------------------------
+
+/// Session ID offset within a ClientHello/ServerHello TLS record frame.
+const SESSION_ID_OFFSET: usize = SESSION_ID_LEN_IDX + 1; // 44
+
+/// Save the original session_id from a ClientHello before HMAC patching.
+fn save_session_id(frame: &[u8]) -> Option<[u8; TLS_SESSION_ID_SIZE]> {
+    if frame.len() < SESSION_ID_OFFSET + TLS_SESSION_ID_SIZE {
+        return None;
+    }
+    let mut sid = [0u8; TLS_SESSION_ID_SIZE];
+    sid.copy_from_slice(&frame[SESSION_ID_OFFSET..SESSION_ID_OFFSET + TLS_SESSION_ID_SIZE]);
+    Some(sid)
+}
+
+/// Restore the original session_id in a ServerHello frame.
+///
+/// The handshake server echoes back our patched session_id, but boring expects
+/// the original one it generated. Restoring it allows boring to continue the
+/// handshake without a DECODE_ERROR.
+fn restore_server_hello_session_id(frame: &mut [u8], original_sid: &[u8; TLS_SESSION_ID_SIZE]) {
+    if frame.len() >= SESSION_ID_OFFSET + TLS_SESSION_ID_SIZE
+        && frame[SESSION_ID_LEN_IDX] == TLS_SESSION_ID_SIZE as u8
+    {
+        frame[SESSION_ID_OFFSET..SESSION_ID_OFFSET + TLS_SESSION_ID_SIZE]
+            .copy_from_slice(original_sid);
+    }
+}
 
 /// Patch the session_id in a ClientHello TLS record to embed our HMAC authentication.
 ///
-/// The frame is the complete TLS record: [type:1][version:2][length:2][body...].
+/// The frame is the complete TLS record(s) from boring's write buffer.
 /// Returns true if patching succeeded.
 fn patch_session_id(frame: &mut [u8], password: &str) -> bool {
-    // TLS record header: 5 bytes
-    // ClientHello body layout:
-    //   msg_type:1 + length:3 + client_version:2 + random:32 + session_id_len:1
-    //   = 39 bytes after TLS header
-    // So session_id_len is at offset 5+39 = 44, but let's use the canonical constants.
     const BODY_START: usize = TLS_HEADER_SIZE; // 5
-    // Inside body: 1(type) + 3(len) + 2(version) + 32(random) + 1(session_id_len) = 39
-    const SESSION_ID_LEN_OFFSET: usize = BODY_START + 1 + 3 + 2 + TLS_RANDOM_SIZE; // 5+39 = 44
-    const SESSION_ID_OFFSET: usize = SESSION_ID_LEN_OFFSET + 1; // 45
 
     if frame.len() < SESSION_ID_OFFSET + TLS_SESSION_ID_SIZE {
         tracing::warn!("ClientHello too short for session ID patching");
         return false;
     }
 
-    // Verify this is a handshake record and it's a ClientHello
-    if frame[0] != HANDSHAKE {
-        return false;
-    }
-    if frame[BODY_START] != CLIENT_HELLO {
+    if frame[0] != HANDSHAKE || frame[BODY_START] != CLIENT_HELLO {
         return false;
     }
 
-    // Check session_id_len == 32 (BoringSSL generates 32-byte legacy session IDs)
-    let sid_len = frame[SESSION_ID_LEN_OFFSET] as usize;
+    // Parse the TLS record length to find the exact end of this record.
+    let record_body_len = u16::from_be_bytes([frame[3], frame[4]]) as usize;
+    let record_end = TLS_HEADER_SIZE + record_body_len;
+    if frame.len() < record_end {
+        tracing::warn!("ClientHello record truncated");
+        return false;
+    }
+
+    let sid_len = frame[SESSION_ID_LEN_IDX] as usize;
     if sid_len != TLS_SESSION_ID_SIZE {
         tracing::warn!("unexpected session_id length: {sid_len}");
         return false;
     }
 
-    // Fill first 28 bytes of session_id with random
-    let session_id_start = SESSION_ID_OFFSET;
-    let session_id_end = session_id_start + TLS_SESSION_ID_SIZE;
+    let session_id_end = SESSION_ID_OFFSET + TLS_SESSION_ID_SIZE;
     let hmac_offset = session_id_end - SESSION_HMAC_SIZE;
 
-    rand::thread_rng().fill(&mut frame[session_id_start..hmac_offset]);
+    // Fill first 28 bytes of session_id with random
+    rand::thread_rng().fill(&mut frame[SESSION_ID_OFFSET..hmac_offset]);
 
     // Zero the HMAC region for computation
     frame[hmac_offset..session_id_end].fill(0);
 
-    // Compute HMAC-SHA1 over the body (excluding TLS header, matching server verification)
-    // Server's verified_extract_sni computes:
-    //   hmac.update(&frame[TLS_HEADER_SIZE..HMAC_IDX]);
-    //   hmac.update(&ZERO4B);
-    //   hmac.update(&frame[HMAC_IDX + SESSION_HMAC_SIZE..]);
-    // Where HMAC_IDX = SESSION_ID_LEN_OFFSET + 1 + TLS_SESSION_ID_SIZE - SESSION_HMAC_SIZE
-    //               = 44 + 1 + 32 - 4 = 73
-    // This is exactly hmac_offset (session_id_end - 4 = 45 + 32 - 4 = 73).
-    // Since we already zeroed the HMAC region, computing over the full body is equivalent.
+    // Compute HMAC-SHA1 over the ClientHello record body only.
     let mut hmac = Hmac::new(password, (&[], &[]));
     hmac.update(&frame[TLS_HEADER_SIZE..hmac_offset]);
     hmac.update(&[0u8; SESSION_HMAC_SIZE]);
-    hmac.update(&frame[hmac_offset + SESSION_HMAC_SIZE..]);
+    hmac.update(&frame[hmac_offset + SESSION_HMAC_SIZE..record_end]);
     let hmac_val = hmac.finalize();
 
     // Write HMAC into session_id
     frame[hmac_offset..session_id_end].copy_from_slice(&hmac_val);
 
     tracing::debug!(
-        "ClientHello session_id patched (frame_len={}, session_id=[{}..{}])",
+        "ClientHello session_id patched (frame_len={}, record_end={})",
         frame.len(),
-        session_id_start,
-        session_id_end,
+        record_end,
     );
     true
 }
 
-/// Check if a buffer starts with a TLS Handshake record (likely ClientHello).
-fn is_handshake_record(data: &[u8]) -> bool {
-    data.len() >= TLS_HEADER_SIZE && data[0] == HANDSHAKE
+// ---------------------------------------------------------------------------
+// Raw ServerHello Parsing
+// ---------------------------------------------------------------------------
+
+/// Extract ServerRandom from a raw ServerHello frame.
+fn extract_server_random_raw(frame: &[u8]) -> Option<[u8; TLS_RANDOM_SIZE]> {
+    const MIN_LEN: usize = TLS_HEADER_SIZE + 1 + 3 + 2 + TLS_RANDOM_SIZE;
+    if frame.len() < MIN_LEN || frame[0] != HANDSHAKE || frame[TLS_HEADER_SIZE] != SERVER_HELLO {
+        return None;
+    }
+    let mut sr = [0u8; TLS_RANDOM_SIZE];
+    sr.copy_from_slice(&frame[SERVER_RANDOM_IDX..SERVER_RANDOM_IDX + TLS_RANDOM_SIZE]);
+    Some(sr)
+}
+
+/// Read exactly one TLS record from TCP (header + body).
+async fn read_tls_frame(tcp: &mut TcpStream) -> io::Result<Vec<u8>> {
+    let header = vec![0u8; TLS_HEADER_SIZE];
+    let (res, header) = tcp.read_exact(header).await;
+    res?;
+
+    let body_len = u16::from_be_bytes([header[3], header[4]]) as usize;
+
+    let mut frame = header;
+    frame.reserve(body_len);
+    let (res, frame_slice) = tcp
+        .read_exact(frame.slice_mut(TLS_HEADER_SIZE..TLS_HEADER_SIZE + body_len))
+        .await;
+    res?;
+
+    Ok(frame_slice.into_inner())
 }
 
 // ---------------------------------------------------------------------------
-// Async Handshake Driver
+// Helpers
 // ---------------------------------------------------------------------------
 
-/// Perform V3 TLS handshake with boring (BoringSSL).
+/// Check if raw TLS data contains an ApplicationData (0x17) record.
+fn contains_application_data(data: &[u8]) -> bool {
+    let mut pos = 0;
+    while pos + TLS_HEADER_SIZE <= data.len() {
+        if data[pos] == APPLICATION_DATA {
+            return true;
+        }
+        if pos + 4 >= data.len() {
+            break;
+        }
+        let record_len = u16::from_be_bytes([data[pos + 3], data[pos + 4]]) as usize;
+        pos += TLS_HEADER_SIZE + record_len;
+    }
+    false
+}
+
+/// Append a random ApplicationData record simulating an encrypted Finished.
+fn append_random_finished(data: &mut Vec<u8>) {
+    let payload_len: usize = 36 + (rand::random::<usize>() % 16);
+    let start = data.len();
+    data.resize(start + TLS_HEADER_SIZE + payload_len, 0);
+    data[start] = APPLICATION_DATA;
+    data[start + 1] = TLS_MAJOR;
+    data[start + 2] = TLS_MINOR.0;
+    data[start + 3] = (payload_len >> 8) as u8;
+    data[start + 4] = payload_len as u8;
+    rand::Rng::fill(&mut rand::thread_rng(), &mut data[start + TLS_HEADER_SIZE..]);
+}
+
+// ---------------------------------------------------------------------------
+// V3 Handshake (boring-driven with real TLS records)
+// ---------------------------------------------------------------------------
+
+/// Perform V3 handshake using boring (BoringSSL) to drive an authentic TLS session.
 ///
-/// Returns the ServerRandom (32 bytes) and whether TLS 1.3 was negotiated.
-/// After this function returns, `tcp` is still usable for the data phase.
+/// Flow:
+/// 1. boring generates ClientHello → we patch session_id with HMAC → send
+/// 2. Read ServerHello → restore original session_id → feed to boring
+/// 3. Read more server frames, feed to boring, let boring produce the client's
+///    second flight (CCS + Finished for TLS 1.3, or CKE + CCS + Finished for 1.2)
+/// 4. Send boring's output over TCP
 ///
-/// The handshake is driven via an in-memory SyncBridge: boring writes/reads
-/// to the bridge synchronously, while we pump data between the bridge and
-/// the real TcpStream asynchronously.
+/// For TLS 1.3: boring produces real CCS but can't produce encrypted Finished
+/// (server's encrypted flight uses different keys due to transcript hash mismatch).
+/// A random ApplicationData record is appended — indistinguishable from real
+/// encrypted data to passive observers.
+///
+/// For TLS 1.2: boring produces the full authentic client flight (ClientKeyExchange +
+/// CCS + encrypted Finished). The Finished hash will be wrong (different transcript),
+/// but the wire traffic is 100% authentic BoringSSL output.
 pub(crate) async fn perform_v3_handshake(
     tcp: &mut TcpStream,
     connector: &SslConnector,
     sni: &str,
     password: &str,
 ) -> io::Result<([u8; 32], bool)> {
-    let bridge = SyncBridge::new();
+    // Phase 1: Generate ClientHello with boring, keep mid-handshake stream
+    let (mut mid, mut client_hello) = start_handshake(connector, sni)?;
 
-    // Create SSL instance configured for this connection
-    let ssl = connector
-        .configure()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("SSL configure: {e}")))?
-        .into_ssl(sni)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("SSL create: {e}")))?;
-
-    // Build SslStreamBuilder with connect state
-    let mut builder = boring::ssl::SslStreamBuilder::new(ssl, bridge);
-    builder.set_connect_state();
-
-    // Attempt initial handshake — this will return WouldBlock since bridge is empty
-    let mut mid: MidHandshakeSslStream<SyncBridge> = match builder.handshake() {
-        Ok(stream) => {
-            // Handshake completed in one shot (shouldn't happen with empty bridge)
-            return flush_and_extract(stream, tcp).await;
-        }
-        Err(HandshakeError::WouldBlock(mid)) => mid,
-        Err(HandshakeError::Failure(mid)) => {
-            return Err(io::Error::new(
-                io::ErrorKind::ConnectionAborted,
-                format!("TLS handshake failed: {}", mid.error()),
-            ));
-        }
-        Err(HandshakeError::SetupFailure(e)) => {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("TLS setup failed: {e}"),
-            ));
-        }
-    };
-
-    let mut first_write = true;
-
-    loop {
-        // Step 1: Flush any pending writes from SSL to network
-        {
-            let bridge = mid.get_mut();
-            if bridge.has_pending_write() {
-                let mut data = bridge.take_write_buf();
-
-                // On the first write (ClientHello), patch the session ID
-                if first_write && is_handshake_record(&data) {
-                    patch_session_id(&mut data, password);
-                    first_write = false;
-                    tracing::debug!(
-                        "ClientHello before sign: {:?}, session_id {:?}",
-                        &data[..data.len().min(80)],
-                        &data[45..45 + 32]
-                    );
-                }
-
-                let (res, _) = tcp.write_all(data).await;
-                res?;
-            }
-        }
-
-        // Step 2: Read from network into bridge
-        {
-            let buf = vec![0u8; 16384];
-            let (res, buf) = tcp.read(buf).await;
-            let n = res?;
-            if n == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "connection closed during handshake",
-                ));
-            }
-            mid.get_mut().feed_read(&buf[..n]);
-        }
-
-        // Step 3: Continue handshake
-        mid = match mid.handshake() {
-            Ok(stream) => {
-                return flush_and_extract(stream, tcp).await;
-            }
-            Err(HandshakeError::WouldBlock(mid)) => mid,
-            Err(HandshakeError::Failure(mid)) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::ConnectionAborted,
-                    format!("TLS handshake failed: {}", mid.error()),
-                ));
-            }
-            Err(HandshakeError::SetupFailure(e)) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("TLS setup failed: {e}"),
-                ));
-            }
-        };
-    }
-}
-
-/// Extract ServerRandom and TLS version from a completed SslStream.
-/// Also flushes any remaining write data to the TCP stream.
-async fn flush_and_extract(
-    mut stream: SslStream<SyncBridge>,
-    tcp: &mut TcpStream,
-) -> io::Result<([u8; 32], bool)> {
-    // Flush any remaining writes from the handshake completion
-    let bridge = stream.get_mut();
-    if bridge.has_pending_write() {
-        let data = bridge.take_write_buf();
-        let (res, _) = tcp.write_all(data).await;
-        res?;
-    }
-
-    let ssl = stream.ssl();
-
-    // Extract ServerRandom
-    let mut server_random = [0u8; 32];
-    let sr_len = ssl.server_random(&mut server_random);
-    if sr_len != 32 {
+    // Phase 2: Save original session_id, then patch with HMAC
+    let original_sid = save_session_id(&client_hello).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "cannot extract session_id")
+    })?;
+    if !patch_session_id(&mut client_hello, password) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("unexpected ServerRandom length: {sr_len}"),
+            "failed to patch ClientHello session_id",
         ));
     }
 
-    // Detect TLS 1.3
-    let tls13 = ssl.version2() == Some(SslVersion::TLS1_3);
+    // Phase 3: Send patched ClientHello
+    let (res, _) = tcp.write_all(client_hello).await;
+    res?;
 
-    tracing::debug!("handshake success (tls1.3={tls13}), ServerRandom: {server_random:?}");
+    // Phase 4: Read ServerHello, extract ServerRandom and TLS version
+    let mut server_hello = read_tls_frame(tcp).await?;
+    let server_random = extract_server_random_raw(&server_hello).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "failed to extract ServerRandom from ServerHello",
+        )
+    })?;
+    let tls13 = crate::util::support_tls13(&server_hello);
+    tracing::debug!("ServerHello received (tls1.3={tls13})");
+
+    // Phase 5: Restore original session_id in ServerHello for boring.
+    // boring verifies the echoed session_id matches what it sent — without
+    // this restore, boring would return DECODE_ERROR.
+    restore_server_hello_session_id(&mut server_hello, &original_sid);
+    mid.get_mut().feed(&server_hello);
+
+    // Phase 6: Continue handshake with boring, feeding server frames and
+    // collecting boring's client flight output.
+    //
+    // TLS 1.3: boring processes ServerHello → writes CCS → reads CCS from
+    //   server → reads encrypted extensions → FAILS (BAD_DECRYPT, expected).
+    //   We get CCS from boring.
+    //
+    // TLS 1.2: boring processes ServerHello → Certificate → ServerKeyExchange →
+    //   ServerHelloDone → writes CKE + CCS + Finished → wants server CCS.
+    //   We get the full client flight from boring.
+    let mut client_flight = Vec::new();
+    let mut client_flight_flushed: usize = 0;
+    // TLS 1.2 with large cert chains can produce many records (cert chain
+    // fragmented across multiple TLS records + ServerKeyExchange + ServerHelloDone).
+    // 20 is generous enough for real-world servers.
+    const MAX_FRAMES: usize = 20;
+    let mut completed = false;
+
+    for _ in 0..MAX_FRAMES {
+        match mid.handshake() {
+            Ok(mut stream) => {
+                // Handshake completed (rare but possible)
+                client_flight.extend(stream.get_mut().take_write_buf());
+                completed = true;
+                break;
+            }
+            Err(HandshakeError::WouldBlock(mut new_mid)) => {
+                let pending = new_mid.get_mut().take_write_buf();
+
+                // Flush any pending writes to TCP before blocking on read.
+                // This is critical for HelloRetryRequest: boring produces a
+                // second ClientHello that must reach the server before it
+                // will send the next flight.
+                if !pending.is_empty() {
+                    client_flight_flushed += pending.len();
+                    let (res, _) = tcp.write_all(pending).await;
+                    res?;
+                }
+
+                // For TLS 1.2: once boring produces substantial output
+                // (CKE + CCS + Finished), stop — the server can't respond
+                // until we send these bytes (would deadlock).
+                if !tls13 && client_flight_flushed > 20 {
+                    tracing::debug!(
+                        "TLS 1.2 client flight ready ({client_flight_flushed} bytes, flushed to TCP)"
+                    );
+                    completed = true;
+                    break;
+                }
+
+                // Read another server frame from TCP and feed to boring
+                let frame = read_tls_frame(tcp).await?;
+                new_mid.get_mut().feed(&frame);
+                mid = new_mid;
+            }
+            Err(HandshakeError::Failure(mut fail_mid)) => {
+                client_flight.extend(fail_mid.get_mut().take_write_buf());
+                let err = fail_mid.error();
+                let err_str = format!("{err}");
+
+                if tls13 && client_flight_flushed > 0 {
+                    // Expected for TLS 1.3: BAD_DECRYPT when boring tries to
+                    // decrypt server's encrypted flight (different transcript hash).
+                    // We verify boring progressed far enough to send CCS
+                    // (client_flight_flushed > 0) — if it failed before producing
+                    // any output, it's a genuine error (bad params, client-auth, etc).
+                    tracing::debug!(
+                        "boring handshake terminated (expected for TLS 1.3): {err_str}"
+                    );
+                    completed = true;
+                    break;
+                } else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        format!("TLS handshake failure: {err_str}"),
+                    ));
+                }
+            }
+            Err(HandshakeError::SetupFailure(e)) => {
+                return Err(io::Error::new(io::ErrorKind::Other, format!("TLS setup failure: {e}")));
+            }
+        }
+    }
+
+    if !completed {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("handshake did not complete within {MAX_FRAMES} server records"),
+        ));
+    }
+
+    // Phase 7: For TLS 1.3, boring produces CCS but can't produce the encrypted
+    // Finished (can't decrypt server's flight → can't compute Finished hash).
+    // Append a random ApplicationData record — encrypted data is indistinguishable
+    // from random to passive observers and DPI systems.
+    if tls13 && !contains_application_data(&client_flight) {
+        append_random_finished(&mut client_flight);
+    }
+
+    // Phase 8: Send client flight
+    if !client_flight.is_empty() {
+        tracing::debug!("sending client flight ({} bytes)", client_flight.len());
+        let (res, _) = tcp.write_all(client_flight).await;
+        res?;
+    }
+
+    tracing::debug!("handshake phase done (tls1.3={tls13})");
     Ok((server_random, tls13))
 }
 
 // ---------------------------------------------------------------------------
-// Fake Request (V3 strict fallback)
+// TLS 1.2 Fallback (V3 strict)
 // ---------------------------------------------------------------------------
 
-/// Perform a fake HTTP request through a TLS connection for V3 strict mode fallback.
+/// Send a fake encrypted HTTP request and drain remaining handshake frames
+/// on the TLS 1.2 fallback path.
 ///
-/// This is used when the handshake was hijacked or TLS 1.3 is not supported.
-/// It sends a realistic Chrome HTTP request to make the connection look normal.
-pub(crate) async fn perform_fake_request(
-    tcp: &mut TcpStream,
-    connector: &SslConnector,
-    sni: &str,
-) -> io::Result<()> {
-    // Do a full TLS handshake (no session ID patching needed)
-    let bridge = SyncBridge::new();
-    let ssl = connector
-        .configure()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("SSL configure: {e}")))?
-        .into_ssl(sni)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("SSL create: {e}")))?;
+/// At this point, `perform_v3_handshake` has already sent boring's authentic
+/// client flight (CKE + CCS + encrypted Finished) via the shadow-tls server's
+/// bidirectional proxy to the handshake server. The handshake server will reject
+/// the Finished (wrong transcript hash) and send a fatal alert.
+///
+/// We send an additional encrypted-looking ApplicationData record (simulating
+/// an HTTP request after the handshake) and drain the server's response to
+/// complete a realistic traffic pattern before closing.
+pub(crate) async fn fake_request_and_drain(tcp: &mut TcpStream, sni: &str) -> io::Result<()> {
+    // Send a fake encrypted HTTP request as ApplicationData.
+    // Size matches a realistic GET request for the configured SNI host.
+    // Content is random (encrypted traffic is indistinguishable from random).
+    let fake_len = format!(
+        "GET / HTTP/1.1\r\nHost: {sni}\r\nUser-Agent: Mozilla/5.0\r\nAccept: */*\r\n\r\n"
+    )
+    .len()
+        + (rand::random::<usize>() % 32);
+    let mut frame = vec![0u8; TLS_HEADER_SIZE + fake_len];
+    frame[0] = APPLICATION_DATA;
+    frame[1] = TLS_MAJOR;
+    frame[2] = TLS_MINOR.0;
+    frame[3] = (fake_len >> 8) as u8;
+    frame[4] = fake_len as u8;
+    rand::Rng::fill(&mut rand::thread_rng(), &mut frame[TLS_HEADER_SIZE..]);
+    let (res, _) = tcp.write_all(frame).await;
+    res?;
 
-    let mut builder = boring::ssl::SslStreamBuilder::new(ssl, bridge);
-    builder.set_connect_state();
-
-    let mut mid = match builder.handshake() {
-        Ok(_stream) => {
-            // Completed immediately - send fake request through stream
-            // This path is unlikely
-            return Ok(());
+    // Drain server response frames (alert from rejected Finished, etc.)
+    for _ in 0..5 {
+        match monoio::time::timeout(std::time::Duration::from_secs(2), read_tls_frame(tcp)).await {
+            Ok(Ok(_)) => continue,
+            _ => break,
         }
-        Err(HandshakeError::WouldBlock(mid)) => mid,
-        Err(_) => return Ok(()), // Best effort
-    };
-
-    // Drive handshake to completion
-    let stream = loop {
-        {
-            let bridge = mid.get_mut();
-            if bridge.has_pending_write() {
-                let data = bridge.take_write_buf();
-                let (res, _) = tcp.write_all(data).await;
-                res?;
-            }
-        }
-        {
-            let buf = vec![0u8; 16384];
-            let (res, buf) = tcp.read(buf).await;
-            let n = res?;
-            if n == 0 {
-                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "EOF during fake handshake"));
-            }
-            mid.get_mut().feed_read(&buf[..n]);
-        }
-        mid = match mid.handshake() {
-            Ok(stream) => break stream,
-            Err(HandshakeError::WouldBlock(m)) => m,
-            Err(_) => return Ok(()),
-        };
-    };
-
-    // Send a fake Chrome HTTP request through the TLS stream
-    let fake_http = format!(
-        "GET / HTTP/1.1\r\nHost: {sni}\r\nUser-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
-         AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36\r\n\
-         Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\n\
-         Accept-Language: en-US,en;q=0.9\r\nConnection: close\r\n\r\n",
-        sni = sni,
-    );
-
-    // Write through SslStream (encrypts the data) → SyncBridge write_buf
-    let mut stream = stream;
-    let _ = stream.write_all(fake_http.as_bytes());
-
-    // Flush bridge → TCP
-    let bridge = stream.get_mut();
-    if bridge.has_pending_write() {
-        let data = bridge.take_write_buf();
-        let (res, _) = tcp.write_all(data).await;
-        let _ = res; // Best effort
     }
 
     Ok(())

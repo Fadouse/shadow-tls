@@ -96,9 +96,18 @@ ciphertext || tag = AES-128-GCM(key, nonce, AAD=tls_header, plaintext=inner_payl
 
 **AuthPending 资源限制**：在等待第一个认证帧期间（如 NewSessionTicket 残留数据排空），不匹配的 ApplicationData 帧会被静默丢弃。该阶段有两个硬限制：累计丢弃字节不超过 64 KiB，且等待时间不超过 10 秒。超出任一限制则触发断开。
 
-## 帧合并（Coalescing）
+## BoringSSL 驱动的握手续接
 
-当发送方从上游读取到少量数据时，会尝试再次读取以将更多数据合并到单个 TLS 记录中（最大约 16 KB）。这减少了小包场景（如网页浏览）下的 AES-GCM 计算次数和 TLS 记录数量，提升吞吐量，且不会为大数据传输增加延迟。
+客户端不仅使用 BoringSSL 生成初始 ClientHello，还通过 BoringSSL 驱动后续握手，产生真实的 TLS 客户端飞行记录：
+
+1. **ClientHello 生成**：boring 生成 ClientHello；在 HMAC 补丁前保存原始 session_id。
+2. **ServerHello 处理**：握手服务器的 ServerHello 被修改以恢复原始 session_id（boring 会验证回显的 session_id），然后反馈给 boring 继续处理。
+3. **客户端飞行产生**：
+   - **TLS 1.3**：boring 处理 ServerHello → 写出真实 CCS → 读取服务器 CCS → 尝试解密加密飞行 → 因不同的转录哈希（patched session_id 导致）而 BAD_DECRYPT 失败（预期行为）。追加一个随机 ApplicationData 记录模拟加密的 Finished（对无密钥的观察者而言，与真实加密数据不可区分）。
+   - **TLS 1.2**：boring 处理 ServerHello → Certificate → ServerKeyExchange → ServerHelloDone → 写出真实的 ClientKeyExchange + CCS + 加密 Finished。Finished 哈希不正确（不同的转录），但线上流量是 100% 真实的 BoringSSL 输出，带有真实的 ECDHE 密钥交换参数。
+4. **Alert 竞态安全性**：握手服务器因错误的 Finished 发送致命 alert，但这需要完整的网络往返（50–200 ms）。shadow-tls 服务器的 AEAD 匹配在本地微秒级完成（AEAD 帧紧跟客户端飞行在 TCP 流中），因此握手中继在 alert 到达前即已终止。alert 永远不会被转发给客户端。
+
+boring SSL 上下文中禁用了证书验证（我们仅使用 boring 生成真实记录，不做安全验证），允许其处理任何服务器的证书链而无需可信 CA。
 
 ## 内层帧（反 TLS-in-TLS）
 
@@ -188,7 +197,7 @@ Stage2: 数据转发（该过程不依赖 TLS 库）
     3. GCM 失败（状态 = AuthPending）：可能为握手残留帧（NewSessionTicket 等），静默丢弃。适用资源限制（64 KiB / 10 秒）。
     4. GCM 失败（状态 = Authenticated）：严格断连——发送 TLS Alert 并关闭。
     说明：Server 在 Client 完成切换后仍可能发送残留 TLS 帧，Client 在 AuthPending 阶段负责过滤。
-3. 向 Server 连接写入数据时，构建内层帧（CMD + DATA_LEN + 数据 + 填充），使用 `key_c2s` 和 `base_nonce XOR seq_be64` 进行 AES-128-GCM 加密，封装为 ApplicationData 并附加 GCM tag。应用两阶段填充。小数据量时使用帧合并。
+3. 向 Server 连接写入数据时，构建内层帧（CMD + DATA_LEN + 数据 + 填充），使用 `key_c2s` 和 `base_nonce XOR seq_be64` 进行 AES-128-GCM 加密，封装为 ApplicationData 并附加 GCM tag。应用两阶段填充。
 
 ## 服务端
 服务端负责转发 TLS 握手、判定切换时机并在切换后做数据封装和解封装，它不依赖 TLS 库。
@@ -204,4 +213,4 @@ Stage1: 转发 TLS 握手
 Stage2: 数据转发（with Data Server）
 1. 使用 ServerRandom 作为 salt，通过 HKDF-SHA256 派生 `key_c2s` 和 `key_s2c`（各 28 字节：16 字节 AES 密钥 + 12 字节基础 nonce）。
 2. ShadowTLS Client → Data Server：解析 ApplicationData，提取 16 字节 GCM tag，使用 `key_c2s` 和 `base_nonce XOR seq_be64` 解密密文。认证失败则按 Alert bad_record_mac 处理。认证成功后解析解密的内层帧，提取真实用户数据（丢弃填充），转发至 Data Server。
-3. Data Server → ShadowTLS Client：构建内层帧，使用 `key_s2c` 进行 AES-128-GCM 加密，封装为 ApplicationData 并附加 GCM tag。对所有帧应用两阶段填充。小数据量时使用帧合并。
+3. Data Server → ShadowTLS Client：构建内层帧，使用 `key_s2c` 进行 AES-128-GCM 加密，封装为 ApplicationData 并附加 GCM tag。对所有帧应用两阶段填充。

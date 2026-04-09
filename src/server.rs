@@ -268,6 +268,10 @@ impl ShadowTlsServer {
             // After verbatim relay ends (handshake server EOF), close the stop channel
             // to let any pending safety logic terminate.
             stop_rx.close();
+            match maybe_pure {
+                Ok(ref data) => tracing::trace!("aead match ok, pure_data len={}", data.len()),
+                Err(ref e) => tracing::warn!("aead match failed: {e}"),
+            }
             maybe_pure?
         };
         tracing::debug!("handshake relay finished");
@@ -502,6 +506,7 @@ async fn copy_by_frame_verbatim(
             },
             buffer_res = read_exact_frame_into(&mut read, g_buffer) => {
                 let buffer = buffer_res?;
+                tracing::trace!("h2c frame: type=0x{:02x}, len={}", buffer[0], buffer.len());
                 // writing is not cancelable
                 let (res, buffer) = write.write_all(buffer).await;
                 res?;

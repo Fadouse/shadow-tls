@@ -482,23 +482,48 @@ async fn copy_remove_appdata_and_decrypt(
     };
 
     loop {
-        // Check AuthPending time limit
-        if !authenticated {
+        // During AuthPending, enforce a timeout on the read so that if the
+        // handshake server goes quiet after sending a fatal alert, we don't
+        // block forever waiting for the next frame.
+        let maybe_frame = if !authenticated {
             if let Some(deadline) = auth_deadline {
-                if std::time::Instant::now() >= deadline {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
                     tracing::warn!("auth pending: time limit exceeded, disconnecting");
                     alert_notifier.close();
                     return;
                 }
+                match monoio::time::timeout(remaining, decoder.next()).await {
+                    Ok(Ok(f)) => f,
+                    Ok(Err(e)) => {
+                        tracing::error!("io error {e}");
+                        alert_notifier.close();
+                        return;
+                    }
+                    Err(_) => {
+                        tracing::warn!("auth pending: time limit exceeded, disconnecting");
+                        alert_notifier.close();
+                        return;
+                    }
+                }
+            } else {
+                match decoder.next().await {
+                    Ok(f) => f,
+                    Err(e) => {
+                        tracing::error!("io error {e}");
+                        alert_notifier.close();
+                        return;
+                    }
+                }
             }
-        }
-
-        let maybe_frame = match decoder.next().await {
-            Ok(f) => f,
-            Err(e) => {
-                tracing::error!("io error {e}");
-                alert_notifier.close();
-                return;
+        } else {
+            match decoder.next().await {
+                Ok(f) => f,
+                Err(e) => {
+                    tracing::error!("io error {e}");
+                    alert_notifier.close();
+                    return;
+                }
             }
         };
         let frame = match maybe_frame {
@@ -510,6 +535,28 @@ async fn copy_remove_appdata_and_decrypt(
         };
         match frame[0] {
             ALERT => {
+                if !authenticated {
+                    // AuthPending: discard ALL alerts (fatal and warning) from the
+                    // handshake server. After our synthetic TLS 1.3 Finished, the
+                    // handshake server will send a fatal alert (bad_record_mac etc.)
+                    // — this is expected and must not tear down the connection before
+                    // the real AEAD frame arrives from the shadow-tls client.
+                    pending_bytes_discarded += frame.len();
+                    if pending_bytes_discarded > AUTH_PENDING_MAX_BYTES {
+                        tracing::warn!("auth pending: byte limit exceeded, disconnecting");
+                        alert_notifier.close();
+                        return;
+                    }
+                    if frame.len() >= TLS_HEADER_SIZE + 2 && frame[TLS_HEADER_SIZE] == 2 {
+                        tracing::debug!(
+                            "auth pending: discarding fatal alert (desc={})",
+                            frame[TLS_HEADER_SIZE + 1]
+                        );
+                    } else {
+                        tracing::debug!("auth pending: discarding warning alert");
+                    }
+                    continue;
+                }
                 return;
             }
             APPLICATION_DATA => {
@@ -594,6 +641,21 @@ async fn copy_remove_appdata_and_decrypt(
                 }
             }
             _ => {
+                if !authenticated {
+                    // AuthPending: discard non-ApplicationData frames (CCS, Handshake, etc.)
+                    // from the incomplete TLS handshake relay.
+                    pending_bytes_discarded += frame.len();
+                    if pending_bytes_discarded > AUTH_PENDING_MAX_BYTES {
+                        tracing::warn!("auth pending: byte limit exceeded, disconnecting");
+                        alert_notifier.close();
+                        return;
+                    }
+                    tracing::debug!(
+                        "auth pending: discarding frame type=0x{:02x}",
+                        frame[0]
+                    );
+                    continue;
+                }
                 alert_notifier.close();
                 return;
             }
@@ -601,10 +663,8 @@ async fn copy_remove_appdata_and_decrypt(
     }
 }
 
-/// Maximum TLS record payload size (16 KiB minus overhead, safe limit).
-const COALESCE_MAX_DATA: usize = 16000;
-/// Coalescing buffer capacity: enough for max TLS record + framing overhead.
-const COALESCE_BUF_SIZE: usize = COALESCE_MAX_DATA + FRAME_OVERHEAD + 256;
+/// Buffer capacity for encrypt-and-send frames.
+const ENCRYPT_BUF_SIZE: usize = 16384 + FRAME_OVERHEAD;
 
 async fn copy_add_appdata_and_encrypt(
     mut read: impl AsyncReadRent,
@@ -614,7 +674,7 @@ async fn copy_add_appdata_and_encrypt(
     alert_enabled: bool,
 ) {
     // Buffer layout: [TLS_HDR:5][TAG:16][CMD:1][DATA_LEN:2][payload...][padding...]
-    let mut buffer = Vec::with_capacity(COALESCE_BUF_SIZE);
+    let mut buffer = Vec::with_capacity(ENCRYPT_BUF_SIZE);
     buffer.resize(FRAME_OVERHEAD, 0);
     buffer[0] = APPLICATION_DATA;
     buffer[1] = TLS_MAJOR;
@@ -636,26 +696,7 @@ async fn copy_add_appdata_and_encrypt(
                     return;
                 }
                 buffer = buf.into_inner();
-                let mut data_len = buffer.len() - FRAME_OVERHEAD;
-
-                // --- Frame coalescing ---
-                // After the first read, try to coalesce more data if the buffer
-                // is small (typical for web browsing with many small packets).
-                // We do another read into the remaining capacity.
-                if data_len < COALESCE_MAX_DATA {
-                    let target_cap = FRAME_OVERHEAD + COALESCE_MAX_DATA;
-                    if buffer.capacity() < target_cap {
-                        buffer.reserve(target_cap - buffer.capacity());
-                    }
-                    let current_len = buffer.len();
-                    let (res2, buf2) = read.read(buffer.slice_mut(current_len..target_cap)).await;
-                    buffer = buf2.into_inner();
-                    if let Ok(n) = res2 {
-                        if n > 0 {
-                            data_len = buffer.len() - FRAME_OVERHEAD;
-                        }
-                    }
-                }
+                let data_len = buffer.len() - FRAME_OVERHEAD;
 
                 // Write inner header: CMD_DATA + data_len
                 buffer[TLS_HMAC_HEADER_SIZE] = CMD_DATA;
