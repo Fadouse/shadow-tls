@@ -1,5 +1,6 @@
 mod boring_tls;
 mod client;
+pub(crate) mod mux;
 mod server;
 pub mod sip003;
 mod util;
@@ -22,6 +23,7 @@ pub enum RunningArgs {
         nodelay: bool,
         fastopen: bool,
         v3: V3Mode,
+        mux: bool,
     },
     Server {
         listen_addr: String,
@@ -31,6 +33,7 @@ pub enum RunningArgs {
         nodelay: bool,
         fastopen: bool,
         v3: V3Mode,
+        mux: bool,
     },
 }
 
@@ -47,6 +50,7 @@ impl RunningArgs {
                 nodelay,
                 fastopen,
                 v3,
+                mux,
             } => Ok(Runnable::Client(ShadowTlsClient::new(
                 listen_addr,
                 target_addr,
@@ -56,6 +60,7 @@ impl RunningArgs {
                 nodelay,
                 fastopen,
                 v3,
+                mux,
             )?)),
             RunningArgs::Server {
                 listen_addr,
@@ -65,6 +70,7 @@ impl RunningArgs {
                 nodelay,
                 fastopen,
                 v3,
+                mux,
             } => Ok(Runnable::Server(ShadowTlsServer::new(
                 listen_addr,
                 target_addr,
@@ -73,6 +79,7 @@ impl RunningArgs {
                 nodelay,
                 fastopen,
                 v3,
+                mux,
             ))),
         }
     }
@@ -89,9 +96,10 @@ impl Display for RunningArgs {
                 nodelay,
                 fastopen,
                 v3,
+                mux,
                 ..
             } => {
-                write!(f, "Client with:\nListen address: {listen_addr}\nTarget address: {target_addr}\nTLS server names: {tls_names}\nTLS Extension: {tls_ext}\nTCP_NODELAY: {nodelay}\nTCP_FASTOPEN:{fastopen}\nV3 Protocol: {v3}")
+                write!(f, "Client with:\nListen address: {listen_addr}\nTarget address: {target_addr}\nTLS server names: {tls_names}\nTLS Extension: {tls_ext}\nTCP_NODELAY: {nodelay}\nTCP_FASTOPEN:{fastopen}\nV3 Protocol: {v3}\nMux: {mux}")
             }
             Self::Server {
                 listen_addr,
@@ -100,9 +108,10 @@ impl Display for RunningArgs {
                 nodelay,
                 fastopen,
                 v3,
+                mux,
                 ..
             } => {
-                write!(f, "Server with:\nListen address: {listen_addr}\nTarget address: {target_addr}\nTLS server address: {tls_addr}\nTCP_NODELAY: {nodelay}\nTCP_FASTOPEN:{fastopen}\nV3 Protocol: {v3}")
+                write!(f, "Server with:\nListen address: {listen_addr}\nTarget address: {target_addr}\nTLS server address: {tls_addr}\nTCP_NODELAY: {nodelay}\nTCP_FASTOPEN:{fastopen}\nV3 Protocol: {v3}\nMux: {mux}")
             }
         }
     }

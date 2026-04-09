@@ -1,13 +1,16 @@
+use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 
 use anyhow::bail;
+use monoio::io::{AsyncReadRent, AsyncReadRentExt, AsyncWriteRent, AsyncWriteRentExt, Splitable};
 use monoio::net::{TcpConnectOpts, TcpStream};
 use rand::seq::SliceRandom;
 use serde::{de::Visitor, Deserialize};
 
 use crate::{
     boring_tls,
+    mux,
     util::{
         bind_with_pretty_error, mod_tcp_conn, resolve, verified_relay, FrameAead,
         V3Mode,
@@ -25,6 +28,7 @@ pub struct ShadowTlsClient {
     nodelay: bool,
     fastopen: bool,
     v3: V3Mode,
+    mux: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -146,6 +150,7 @@ impl ShadowTlsClient {
         nodelay: bool,
         fastopen: bool,
         v3: V3Mode,
+        mux: bool,
     ) -> anyhow::Result<Self> {
         let alpn = tls_ext_config.alpn.unwrap_or_default();
         let ssl_connector = boring_tls::build_chrome_ssl_connector(&alpn)
@@ -160,6 +165,7 @@ impl ShadowTlsClient {
             nodelay,
             fastopen,
             v3,
+            mux,
         })
     }
 
@@ -167,16 +173,24 @@ impl ShadowTlsClient {
     pub async fn serve(self) -> anyhow::Result<()> {
         let listener = bind_with_pretty_error(self.listen_addr.as_ref(), self.fastopen)?;
         let shared = Rc::new(self);
+        // Mux pool: shared across all connections on this thread.
+        // Each monoio thread gets its own pool (Rc, not Arc).
+        let mux_pool: Rc<mux::MuxPool> = Rc::new(mux::MuxPool::new(4));
         loop {
             match listener.accept().await {
                 Ok((mut conn, addr)) => {
                     tracing::info!("Accepted a connection from {addr}");
                     let client = shared.clone();
+                    let pool = mux_pool.clone();
                     mod_tcp_conn(&mut conn, true, shared.nodelay);
                     monoio::spawn(async move {
-                        match client.relay(conn).await {
-                            Ok(()) => {}
-                            Err(e) => tracing::warn!("Relay error for {addr}: {e:#}"),
+                        let result = if client.mux {
+                            client.relay_mux(conn, &pool).await
+                        } else {
+                            client.relay(conn).await
+                        };
+                        if let Err(e) = result {
+                            tracing::warn!("Relay error for {addr}: {e:#}");
                         }
                         tracing::info!("Relay for {addr} finished");
                     });
@@ -188,7 +202,7 @@ impl ShadowTlsClient {
         }
     }
 
-    /// Main relay (V3 protocol).
+    /// Main relay (V3 protocol, non-mux: one TLS connection per client connection).
     async fn relay(&self, in_stream: TcpStream) -> anyhow::Result<()> {
         let addr = resolve(&self.target_addr).await?;
         let mut stream = TcpStream::connect_addr_with_config(
@@ -205,12 +219,6 @@ impl ShadowTlsClient {
                 .await?;
 
         if !tls13 {
-            // TLS 1.2: BoringSSL's Finished has wrong transcript hash, so the
-            // handshake server will reject it. All modes bail here because:
-            //   - Strict: explicitly rejects TLS 1.2
-            //   - Lossy/Disabled: can't produce valid AEAD relay (server-side
-            //     strict stays in bidirectional proxy mode, not data relay)
-            // Send a fake request to complete a realistic traffic pattern.
             let mode_name = match self.v3 {
                 V3Mode::Strict => "strict",
                 V3Mode::Lossy => "lossy",
@@ -221,8 +229,6 @@ impl ShadowTlsClient {
             bail!("TLS 1.3 is not supported ({mode_name} mode)");
         }
 
-        // Client flight (CCS + encrypted Finished) was already sent by
-        // perform_v3_handshake using boring's authentic TLS output.
         tracing::debug!("Authorized, ServerRandom extracted: {server_random:?}");
         let frame_aead_c2s = FrameAead::new(&self.password, &server_random, b"c2s");
         let frame_aead_s2c = FrameAead::new(&self.password, &server_random, b"s2c");
@@ -236,6 +242,87 @@ impl ShadowTlsClient {
             true,
         )
         .await;
+        Ok(())
+    }
+
+    /// Mux relay: reuse an existing TLS connection or create a new one.
+    /// Multiple client connections share a single TLS session via stream multiplexing.
+    async fn relay_mux(&self, in_stream: TcpStream, pool: &mux::MuxPool) -> anyhow::Result<()> {
+        // Try to reuse an existing session with capacity
+        let session = if let Some(s) = pool.get_session() {
+            s
+        } else {
+            // No available session — establish a new TLS connection
+            let addr = resolve(&self.target_addr).await?;
+            let mut stream = TcpStream::connect_addr_with_config(
+                addr,
+                &TcpConnectOpts::default().tcp_fast_open(self.fastopen),
+            )
+            .await?;
+            mod_tcp_conn(&mut stream, true, self.nodelay);
+
+            let sni = self.tls_names.random_choose();
+            let (server_random, tls13) =
+                boring_tls::perform_v3_handshake(&mut stream, &self.ssl_connector, sni, &self.password)
+                    .await?;
+
+            if !tls13 {
+                boring_tls::fake_request_and_drain(&mut stream, sni).await?;
+                bail!("TLS 1.3 is not supported (mux requires TLS 1.3)");
+            }
+
+            tracing::debug!("Mux: new TLS session established");
+            let aead_c2s = FrameAead::new(&self.password, &server_random, b"c2s");
+            let aead_s2c = FrameAead::new(&self.password, &server_random, b"s2c");
+
+            let s = mux::create_client_session(stream, aead_c2s, aead_s2c);
+            pool.add_session(s.clone());
+            s
+        };
+
+        // Open a new stream on the mux session
+        let (stream_id, mut data_rx) = session.open_stream();
+        tracing::debug!("Mux stream {stream_id} opened");
+
+        let (in_read, in_write) = in_stream.into_split();
+
+        let session_for_write = session.clone();
+        let sid = stream_id;
+        let _ = monoio::join!(
+            // Client app -> mux stream
+            async {
+                let mut in_read = in_read;
+                let mut buf = vec![0u8; 16384];
+                loop {
+                    let (res, b) = in_read.read(buf).await;
+                    buf = b;
+                    match res {
+                        Ok(0) | Err(_) => {
+                            session_for_write.close_stream(sid);
+                            return;
+                        }
+                        Ok(n) => {
+                            if !session_for_write.send_data(sid, buf[..n].to_vec()) {
+                                return;
+                            }
+                        }
+                    }
+                }
+            },
+            // Mux stream -> client app
+            async {
+                let mut in_write = in_write;
+                while let Some(data) = data_rx.recv().await {
+                    let (res, _) = in_write.write_all(data).await;
+                    if res.is_err() {
+                        return;
+                    }
+                }
+                let _ = in_write.shutdown().await;
+            }
+        );
+
+        pool.cleanup();
         Ok(())
     }
 }

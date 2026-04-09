@@ -24,10 +24,12 @@ ssserver (Shadowsocks 服务端)
 **防检测特性:**
 - BoringSSL（Chrome 的 TLS 库）驱动真实 TLS 握手，ClientHello 指纹与 Chrome 完全一致
 - 包含 X25519Kyber768 后量子密钥交换（~1200 字节密钥份额），原生 GREASE
-- 逐帧 AES-128-GCM AEAD 认证 (HKDF-SHA256 密钥派生，64 位序号)
-- 前 8 个数据包随机 padding，消除 TLS-in-TLS 指纹
-- BoringSSL 续接握手产生真实客户端飞行记录 (CCS + Finished)
-- NewSessionTickets 完整中继 (绕过缺失检测)
+- 逐帧 AES-128-GCM AEAD 加密 (HKDF-SHA256 密钥派生，64 位序号)
+- 合成 Finished 精确匹配真实 TLS 1.3 大小 (53/69 字节)，防止被动指纹检测
+- 随机化填充边界 [5,13] + 5% 尾部填充，消除跨连接 TLS-in-TLS 统计指纹
+- 帧合并 (Coalescing): 减少小帧数量，产出更接近真实 HTTPS 的 TLS 记录模式
+- NewSessionTickets 逐字转发，不修改帧长度 (绕过 aparecium 类检测)
+- **多路复用 (Mux)**: 多个连接共享一条 TLS 隧道，减少握手开销，天然打散流量模式
 
 ---
 
@@ -97,7 +99,7 @@ ssserver -s "127.0.0.1:8388" \
 ### 2.2 启动 ShadowTLS 服务端
 
 ```bash
-shadow-tls --v3 --strict server \
+shadow-tls --v3 --strict --mux server \
     --listen "[::]:443" \
     --server "127.0.0.1:8388" \
     --tls "www.google.com" \
@@ -106,10 +108,13 @@ shadow-tls --v3 --strict server \
 
 参数说明：
 - `--v3 --strict`: 启用 V3 协议严格模式 (仅 TLS 1.3，最安全)
+- `--mux`: 启用多路复用 (多连接共享单条 TLS 隧道，减少握手开销)
 - `--listen "[::]:443"`: 监听所有接口的 443 端口 (对外伪装 HTTPS)
 - `--server "127.0.0.1:8388"`: 内部 Shadowsocks 服务端地址
 - `--tls "www.google.com"`: 握手伪装目标
 - `--password`: ShadowTLS 认证密码
+
+> **提示**: `--mux` 需客户端和服务端同时启用。不加 `--mux` 时行为与旧版完全兼容。
 
 ### 2.3 systemd 服务 (推荐)
 
@@ -138,7 +143,7 @@ Requires=ssserver.service
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/shadow-tls --v3 --strict server --listen "[::]:443" --server "127.0.0.1:8388" --tls "www.google.com" --password "YOUR_STLS_PASSWORD"
+ExecStart=/usr/local/bin/shadow-tls --v3 --strict --mux server --listen "[::]:443" --server "127.0.0.1:8388" --tls "www.google.com" --password "YOUR_STLS_PASSWORD"
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=65536
@@ -160,7 +165,7 @@ sudo systemctl status shadow-tls
 ### 3.1 启动 ShadowTLS 客户端
 
 ```bash
-shadow-tls --v3 --strict client \
+shadow-tls --v3 --strict --mux client \
     --listen "127.0.0.1:1443" \
     --server "YOUR_VPS_IP:443" \
     --sni "www.google.com" \
@@ -171,6 +176,7 @@ shadow-tls --v3 --strict client \
 - `--listen "127.0.0.1:1443"`: 本地监听地址 (sslocal 连接到这里)
 - `--server "YOUR_VPS_IP:443"`: 服务端 ShadowTLS 地址
 - `--sni "www.google.com"`: 必须与服务端 `--tls` 一致
+- `--mux`: 启用多路复用 (必须与服务端一致)
 - `--password`: 必须与服务端一致
 
 ### 3.2 启动 Shadowsocks 客户端
@@ -300,7 +306,7 @@ sudo tcpdump -i eth0 port 443 -w capture.pcap
 tshark -r capture.pcap -Y "tls.record.content_type == 23" -T fields -e tls.record.length
 ```
 
-正常情况下，前 8 个数据包长度应在 200-1400 范围内随机分布，而非 Shadowsocks 固有的特征长度。
+正常情况下，前 5-13 个数据包 (随机化边界) 长度应在 200-1400 范围内随机分布，而非 Shadowsocks 固有的特征长度。启用 `--mux` 后，多个流的数据交错合并，TLS 记录模式更接近真实 HTTP/2 流量。
 
 ### 运行 aparecium 检测
 
@@ -343,12 +349,14 @@ RUST_LOG=debug shadow-tls --v3 --strict server ...
 ```bash
 # === 服务端 (VPS) ===
 ssserver -s 127.0.0.1:8388 -m 2022-blake3-aes-128-gcm -k "$SS_PASSWORD" &
-shadow-tls --v3 --strict server --listen [::]:443 --server 127.0.0.1:8388 --tls www.google.com --password "$STLS_PASSWORD" &
+shadow-tls --v3 --strict --mux server --listen [::]:443 --server 127.0.0.1:8388 --tls www.google.com --password "$STLS_PASSWORD" &
 
 # === 客户端 (本地) ===
-shadow-tls --v3 --strict client --listen 127.0.0.1:1443 --server VPS_IP:443 --sni www.google.com --password "$STLS_PASSWORD" &
+shadow-tls --v3 --strict --mux client --listen 127.0.0.1:1443 --server VPS_IP:443 --sni www.google.com --password "$STLS_PASSWORD" &
 sslocal -b 127.0.0.1:1080 -s 127.0.0.1:1443 -m 2022-blake3-aes-128-gcm -k "$SS_PASSWORD" &
 
 # === 测试 ===
 curl --socks5 127.0.0.1:1080 http://captive.apple.com/
 ```
+
+> **不使用多路复用**: 去掉 `--mux` 即可回退到每连接独立 TLS 隧道模式，与旧版完全兼容。

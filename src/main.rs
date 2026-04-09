@@ -57,6 +57,9 @@ struct Opts {
     #[serde(default = "default_false")]
     #[clap(long, help = "Strict mode(only for v3 protocol)")]
     strict: bool,
+    #[serde(default = "default_false")]
+    #[clap(long, help = "Enable connection multiplexing(multiple streams over one TLS connection)")]
+    mux: bool,
 }
 
 #[derive(Subcommand, Debug, Deserialize)]
@@ -185,6 +188,7 @@ impl From<Args> for RunningArgs {
                 nodelay: !args.opts.disable_nodelay,
                 fastopen: args.opts.fastopen,
                 v3,
+                mux: args.opts.mux,
             },
             Commands::Server {
                 listen,
@@ -202,6 +206,7 @@ impl From<Args> for RunningArgs {
                     nodelay: !args.opts.disable_nodelay,
                     fastopen: args.opts.fastopen,
                     v3,
+                    mux: args.opts.mux,
                 }
             }
             Commands::Config { config: _ } => {

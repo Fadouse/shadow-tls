@@ -36,6 +36,7 @@ pub struct ShadowTlsServer {
     nodelay: bool,
     fastopen: bool,
     v3: V3Mode,
+    mux: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -173,6 +174,7 @@ impl ShadowTlsServer {
         nodelay: bool,
         fastopen: bool,
         v3: V3Mode,
+        mux: bool,
     ) -> Self {
         Self {
             listen_addr: Arc::new(listen_addr),
@@ -182,6 +184,7 @@ impl ShadowTlsServer {
             nodelay,
             fastopen,
             v3,
+            mux,
         }
     }
 }
@@ -349,21 +352,40 @@ impl ShadowTlsServer {
         // early drop useless resources
         drop(first_server_frame);
 
-        // stage 2.2: copy ShadowTLS Client -> Data Server
-        // stage 2.3: copy Data Server -> ShadowTLS Client
-        let mut data_stream = TcpStream::connect_addr(data_addr).await?;
-        mod_tcp_conn(&mut data_stream, true, self.nodelay);
-        let (res, _) = data_stream.write_all(pure_data).await;
-        res?;
-        verified_relay(
-            data_stream,
-            unsafe { c_read.reunite(c_write).unwrap_unchecked() },
-            frame_aead_s2c,
-            frame_aead_c2s,
-            !use_tls13,
-            false, // server: already authenticated client via SessionID + first HMAC frame
-        )
-        .await;
+        let tls_stream = unsafe { c_read.reunite(c_write).unwrap_unchecked() };
+
+        // Detect mux mode: if the first decrypted payload starts with CMD_MUX_SYN (0x02),
+        // the client is using multiplexing. Otherwise it's legacy 1:1 relay.
+        if self.mux && !pure_data.is_empty() && pure_data[0] == CMD_MUX_SYN {
+            // Parse the SYN frame from pure_data (it's the raw inner payload)
+            if let Some((syn_frame, _)) = crate::mux::MuxFrame::decode(&pure_data) {
+                tracing::info!("Mux mode detected, entering mux dispatcher");
+                crate::mux::mux_server_dispatch(
+                    tls_stream,
+                    frame_aead_s2c,
+                    frame_aead_c2s,
+                    &self.target_addr,
+                    self.nodelay,
+                    syn_frame,
+                )
+                .await?;
+            }
+        } else {
+            // Legacy 1:1 relay
+            let mut data_stream = TcpStream::connect_addr(data_addr).await?;
+            mod_tcp_conn(&mut data_stream, true, self.nodelay);
+            let (res, _) = data_stream.write_all(pure_data).await;
+            res?;
+            verified_relay(
+                data_stream,
+                tls_stream,
+                frame_aead_s2c,
+                frame_aead_c2s,
+                !use_tls13,
+                false,
+            )
+            .await;
+        }
         Ok(())
     }
 }
@@ -556,6 +578,11 @@ async fn copy_by_frame_until_aead_matches(
                 match crate::util::parse_inner_frame(&decrypt_buf) {
                     Some((CMD_DATA, data)) if !data.is_empty() => {
                         return Ok(data.to_vec());
+                    }
+                    Some((CMD_MUX_SYN, _)) => {
+                        // Mux mode: return the entire decrypted inner payload
+                        // (including CMD byte) so the caller can parse the SYN.
+                        return Ok(decrypt_buf.clone());
                     }
                     Some((CMD_PADDING, _)) | Some((CMD_DATA, _)) => {
                         // Valid AEAD frame but padding/empty — keep reading
