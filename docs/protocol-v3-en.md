@@ -1,217 +1,208 @@
 ---
 title: ShadowTLS V3 Protocol
 date: 2023-02-06 11:00:00
-updated: 2026-04-08 00:00:00
+updated: 2026-04-09 00:00:00
 author: ihciah
 ---
 
 # Version Evolution
-In August 2022 I implemented the first version of the ShadowTLS protocol. The goal of the V1 protocol was simple: to evade man-in-the-middle traffic discrimination by simply proxying the TLS handshake. v1 assumed that the man-in-the-middle would only observe handshake traffic, not subsequent traffic, not active probes, and not traffic hijacking.
 
-However, this assumption does not hold true. In order to defend against active probing, the V2 version of the protocol added a mechanism to verify the identity of the client by challenge-response; and added Application Data encapsulation to better disguise the traffic.
+In August 2022 the first version of ShadowTLS was implemented. V1 simply proxied the TLS handshake to evade traffic discrimination, assuming the middleman would only observe handshake traffic.
 
-The V2 version works well so far, and I have not encountered any problem of being blocked in daily use. After implementing support for multiple SNIs, it can even work as an SNI Proxy, which doesn't look like a proxy for data smuggling at all.
+V2 added challenge-response client authentication and ApplicationData encapsulation. It works well and has not been blocked in practice. With multi-SNI support it can even operate as an SNI proxy, appearing indistinguishable from a normal TLS reverse proxy.
 
-But the V2 protocol still assumes that the middleman will not do traffic hijacking (refer to [issue](https://github.com/ihciah/shadow-tls/issues/30)). The cost of traffic hijacking is relatively high, and it is not widely used at present. The means of man-in-the-middle are still mainly bypass observation and injection, and active detection. However, this does not mean that traffic hijacking will not be used on a large scale in the future, and protocols designed to resist traffic hijacking must be a better solution. One of the biggest problems faced is that it is difficult for the server side to identify itself covertly.
+However, V2 still assumes the middleman will not perform traffic hijacking (see [issue #30](https://github.com/ihciah/shadow-tls/issues/30)). The [restls](https://github.com/3andne/restls) project (proposed in [issue #66](https://github.com/ihciah/shadow-tls/issues/66)) provided an innovative approach to covert server-side identity verification.
 
-The [restls](https://github.com/3andne/restls) proposed in this [issue](https://github.com/ihciah/shadow-tls/issues/66) provides a very innovative idea. With this idea we can solve the server-side identity problem.
+V3 addresses all known attack vectors: traffic signature detection, active probing, and traffic hijacking.
 
-In addition, I also mentioned in [this blog](https://www.ihcblog.com/a-better-tls-obfs-proxy/) some possible hijacking attacks against data encapsulation, which must be addressed by the V3 protocol.
+# V3 Protocol Goals
 
+1. Defend against traffic signature detection, active probing, and traffic hijacking.
+2. Easy to implement correctly.
+3. Minimal awareness of TLS internals — implementers need not hack TLS libraries or implement TLS themselves.
+4. Keep it simple: act only as a TCP stream proxy.
 
-# V3 Protocol Principle
-1. Capable of defending against traffic signature detection, active detection and traffic hijacking.
-2. Easier to implement correctly.
-3. Be as weakly aware of the TLS protocol itself as possible, so implementers do not need to hack the TLS library, let alone implement the TLS protocol themselves.
-4. Keep it simple: only act as a TCP flow proxy, no duplicate wheel building.
+## TLS Version Support
 
-## About support for TLS 1.2
-The V3 protocol only supports handshake servers using TLS1.3 in strict mode. You can use `openssl s_client -tls1_3 -connect example.com:443` to detect whether a server supports TLS1.3.
+V3 **requires TLS 1.3** from the handshake server. Test with: `openssl s_client -tls1_3 -connect example.com:443`.
 
-If you want to support TLS1.2, you need to perceive more details of the TLS protocol, and the implementation will be more complicated; since TLS1.3 is already used by many manufacturers, we decided to only support TLS1.3 in strict mode.
-
-Considering compatibility and some scenarios that require less protection against connection hijacking (such as using a specific SNI to bypass the billing system), TLS1.2 is allowed in non-strict mode.
+BoringSSL cannot produce a valid TLS 1.2 Finished (wrong transcript hash due to patched session_id), so all modes bail on TLS 1.2. The client sends a fake encrypted request and drains the server response to complete a realistic traffic pattern before closing.
 
 # Handshake
-This part of the protocol design is based on [restls](https://github.com/3andne/restls), but there are some differences: it is less aware of the details of TLS and easier to implement.
 
-The client's TLS Client constructs the ClientHello, which generates a custom SessionID. The length of the SessionID must be 32, the first 28 bits are random values, and the last 4 bits are the HMAC signature data of the ClientHello frame (without the 5-byte header of the TLS frame, the 4 bytes after the SessionID are filled with 0). The HMAC instance is for one-time use only, and the instance is created directly using the password. A Read Wrapper is also needed to extract the ServerRandom from ServerHello and forward the subsequent streams. 2.
-When the server receives the packet, it will authenticate the ClientHello, and if the authentication fails, it will continue the TCP relay with the handshake server. If the identification is successful, it will also forward it to the handshake server and continuously hijack the return stream from the handshake server. The server side will.
-    1. log the ServerRandom in the forwarded ServerHello.
-    2. do the following with the content portion of all ApplicationData frames.
-        1. transform the data to XOR SHA256 (PreSharedKey + ServerRandom). 2.
-        2. Add the 4 byte prefix `HMAC_ServerRandom(processed frame data)`, the HMAC instance should be filled with ServerRandom as the initial value, and this HMAC instance should be reused for subsequent ApplicationData forwarded from the handshake server. Note that the frame length needs to be + 4 at the same time. 3.
-The client's ReadWrapper needs to parse the ApplicationData frame and determine the first 4 byte HMAC: 1.
-    1. If `HMAC_ServerRandom(frame data)` is met, the server is proven to be reliable. These frames need to be filtered out after the handshake is complete. 2.
-    2. If `HMAC_ServerRandomS(frame data)` is met, it proves that the data has finished switching. The content part needs to be forwarded to the user side.
-    3. If none of them match, the traffic may have been hijacked and the handshake needs to be continued (or stopped if the handshake fails) and a random length HTTP request (muddled request) sent after a successful handshake and the connection closed properly after the response is read.
+## Session ID Authentication
 
-## Security Verification
-1. When traffic is hijacked, Server will return data without doing XOR and Client will go straight to the muddling process.
-2. ClientHello may be replayed but cannot use its correct handshake ([discussion of restls](https://github.com/3andne/restls/blob/main/Restls%3A%20%E5%AF%B9TLS%E6%8F%A1%E6%89%8B%E7%9A%84%E5%AE%8C%E7%BE%8E%E4%BC%AA%E8%A3%85.md)), so there is no way to identify whether the XOR data we return with a prefix is decodable.
-2. If Client pretends the data is decrypted successfully and sends the data directly, it will not be able to pass because of the data frame checksum.
+The client constructs a ClientHello with a custom 32-byte SessionID:
+
+```
+SessionID (32 bytes) = [28 random bytes] [4-byte HMAC-SHA1]
+```
+
+The HMAC is computed over the ClientHello record body (excluding the 5-byte TLS header) with the SessionID's last 4 bytes zeroed during computation. The HMAC key is the shared password.
+
+The server verifies this HMAC to authenticate the client. On failure, the server falls back to plain TCP relay with the handshake server (indistinguishable from a real TLS reverse proxy to active probers).
+
+## BoringSSL-Driven Handshake
+
+The client uses **BoringSSL** (Chrome's TLS library) to drive an authentic TLS handshake, producing real TLS records:
+
+### Normal Flow (TLS 1.3)
+
+```
+Client (boring)          Shadow-TLS Server          Handshake Server
+     |                         |                         |
+     |--- ClientHello -------->|--- ClientHello -------->|
+     |   (session_id patched)  |   (HMAC verified)       |
+     |                         |                         |
+     |<-- ServerHello ---------|<-- ServerHello ----------|
+     |   (session_id restored) |   (ServerRandom saved)  |
+     |                         |                         |
+     |   (boring processes server flight, produces CCS)  |
+     |                         |                         |
+     |--- CCS + fake Finished->|--- forwarded ---------->|
+     |   (random AppData)      |                         |
+     |                         |                         |
+     |=== AEAD data phase ====>|===> Data Server =======>|
+```
+
+1. **ClientHello**: boring generates it; we save the original session_id, patch it with HMAC, and send.
+2. **ServerHello**: restore original session_id (boring verifies the echo), extract ServerRandom, feed to boring.
+3. **Client flight**: boring writes CCS. It then attempts to decrypt the server's encrypted extensions, which fails with BAD_DECRYPT (expected — different transcript hash). A random ApplicationData record is appended as synthetic Finished.
+4. **Data phase**: both sides derive AEAD keys from ServerRandom and begin authenticated relay.
+
+### HelloRetryRequest (HRR)
+
+If the handshake server sends a HelloRetryRequest (detected by the fixed synthetic ServerRandom defined in RFC 8446 §4.1.3), both client and server handle it:
+
+**Client side:**
+1. Feed HRR to boring → boring produces a new ClientHello (CH2).
+2. CH2 must carry the **same** session_id as CH1 (RFC 8446 §4.1.2). We overwrite CH2's session_id with the patched value from CH1.
+3. Save boring's new original session_id for restoring in the real ServerHello.
+4. Read the real ServerHello, extract the real ServerRandom.
+
+**Server side:**
+1. Detect HRR by its synthetic ServerRandom.
+2. Relay the retry ClientHello from the shadow-tls client to the handshake server.
+3. Read the real ServerHello, extract the real ServerRandom for AEAD key derivation.
+
+Double HRR is rejected as a protocol error.
+
+### Alert Race Safety
+
+The handshake server rejects the incorrect Finished and sends a fatal alert, but this requires a full network round trip (50–200 ms). The shadow-tls server's AEAD match happens locally in microseconds (the AEAD frame immediately follows the client flight in the TCP stream), so the handshake relay terminates before the alert arrives. During the AuthPending phase, all alerts from the handshake server are silently discarded.
+
+Certificate verification is disabled in the BoringSSL context — boring is used only for authentic record generation, not security validation.
 
 # Data Encapsulation
 
-The V2 version of the data encapsulation protocol is in fact not resistant to traffic hijacking, e.g., the middleman may tamper with this part of the data after the handshake is completed, and we need to be able to respond to Alert; the middleman may also split one ApplicationData package into two as in the V2 protocol, which can also be used to identify the protocol if the connection is normal.
-
-To deal with traffic hijacking, in addition to optimizing the handshake process, the data encapsulation part also needs to be redesigned. We need to be able to authenticate the data stream and resist attacks such as replay, data tampering, data slicing, and data disorder.
-
 ## Key Derivation
 
-After the TLS handshake completes and ServerRandom is known, both sides derive per-direction keys using **HKDF-SHA256**:
+After the handshake, both sides derive per-direction keys using **HKDF-SHA256**:
 
 ```
-okm_c2s = HKDF-SHA256(IKM=password, salt=ServerRandom, info="c2s")  →  28 bytes
-okm_s2c = HKDF-SHA256(IKM=password, salt=ServerRandom, info="s2c")  →  28 bytes
+okm = HKDF-SHA256(IKM=password, salt=ServerRandom, info=direction)  →  28 bytes
 ```
 
-Each 28-byte output is split into:
+Where `direction` is `"c2s"` or `"s2c"`. Each 28-byte output is split into:
 - **AES key** (first 16 bytes): AES-128-GCM encryption key
 - **Base nonce** (last 12 bytes): base value for GCM nonce construction
 
-The use of ServerRandom as the HKDF salt binds the data-phase keys to the specific TLS session, preventing cross-session replay attacks.
+Using ServerRandom as the HKDF salt binds keys to the specific TLS session, preventing cross-session replay.
 
 ## Per-Frame AEAD (AES-128-GCM)
 
-Each ApplicationData frame is independently encrypted and authenticated with **AES-128-GCM** (hardware-accelerated via AES-NI, ~10 GB/s throughput):
+Each ApplicationData frame is independently encrypted and authenticated:
 
 ```
 nonce       = base_nonce XOR (seq_be64 right-aligned to 12 bytes)
-ciphertext || tag = AES-128-GCM(key, nonce, AAD=tls_header, plaintext=inner_payload)
+ciphertext || tag = AES-128-GCM(key, nonce, AAD=tls_header, plaintext)
 ```
 
-- `seq_be64`: 64-bit frame sequence number (big-endian), starts at 0 and increments per frame per direction. The 64-bit counter eliminates nonce overflow risk (u32 would overflow at ~64 TB of data). The sequence number is XORed into the last 8 bytes of the base nonce.
-- `tls_header`: the 5-byte TLS record header (`type || major || minor || len_hi || len_lo`), used as Additional Authenticated Data (AAD). This prevents header manipulation (e.g., length field tampering).
-- `inner_payload`: the plaintext inner frame (inner header + data + padding), encrypted in-place to ciphertext.
-
-The 16-byte GCM authentication tag provides both integrity and authenticity. The inner payload is also encrypted, adding confidentiality on top of the outer TLS encryption.
-
-The encapsulated frame format is:
+Wire format:
 
 ```
-(5B TLS record header)(16B GCM tag)(encrypted: 1B CMD | 2B DATA_LEN | user data | optional padding)
+[5B TLS header] [16B GCM tag] [encrypted: 1B CMD | 2B DATA_LEN | data | padding]
 ```
 
-**Strict sequence policy**: once a connection has been authenticated (first valid GCM frame received), any subsequent GCM verification failure results in immediate disconnection without retrying. This eliminates oracle attacks on the sequence counter.
-
-**AuthPending resource limits**: while waiting for the first authenticated frame (e.g., during NewSessionTicket drain), non-matching ApplicationData frames are discarded silently. This state has two hard limits: 64 KiB of discarded bytes and 10 seconds of elapsed time. Exceeding either limit triggers disconnection.
-
-## BoringSSL-Driven Handshake Continuation
-
-The client uses BoringSSL not only to generate the initial ClientHello, but also to drive the subsequent handshake, producing authentic TLS client flight records:
-
-1. **ClientHello generation**: boring generates the ClientHello; the original session_id is saved before HMAC patching.
-2. **ServerHello processing**: The handshake server's ServerHello is modified to restore the original session_id (boring verifies the echoed session_id), then fed back to boring for continued processing.
-3. **Client flight production**:
-   - **TLS 1.3**: boring processes ServerHello → writes real CCS → reads server CCS → attempts to decrypt the encrypted flight → fails with BAD_DECRYPT (expected: different transcript hash due to patched session_id). A random ApplicationData record is appended to simulate the encrypted Finished (indistinguishable from real encrypted data to any observer without keys).
-   - **TLS 1.2**: boring processes ServerHello → Certificate → ServerKeyExchange → ServerHelloDone → writes authentic ClientKeyExchange + CCS + encrypted Finished. The Finished hash is incorrect (different transcript), but the wire traffic is 100% authentic BoringSSL output with real ECDHE key exchange parameters.
-4. **Alert race safety**: The handshake server rejects the incorrect Finished and sends a fatal alert, but this requires a full network round trip (50–200 ms). The shadow-tls server's AEAD match happens locally in microseconds (the AEAD frame immediately follows the client flight in the TCP stream), so the handshake relay terminates before the alert arrives. The alert is never forwarded to the client.
-
-Certificate verification is disabled in the boring SSL context (we only use boring for authentic record generation, not security validation), allowing it to process any server's certificate chain without trusted CA requirements.
+- **Sequence number**: 64-bit, big-endian, starts at 0, increments per frame per direction. XORed into the last 8 bytes of the base nonce.
+- **AAD**: the 5-byte TLS record header, preventing header manipulation.
+- **Strict sequence policy**: after authentication, any GCM failure = immediate disconnect.
+- **AuthPending limits**: before first valid GCM frame, non-matching frames are discarded (max 64 KiB, max 10 seconds).
 
 ## Inner Framing (Anti TLS-in-TLS)
 
-To prevent statistical detection of inner-protocol traffic fingerprints (e.g., Shadowsocks's characteristic first-packet sizes), each ApplicationData payload carries a 3-byte inner header:
+Each encrypted payload carries a 3-byte inner header to prevent statistical fingerprinting of the inner protocol:
 
 ```
-[CMD : 1 byte][DATA_LEN : 2 bytes big-endian][user data : DATA_LEN bytes][padding : variable]
+[CMD : 1B] [DATA_LEN : 2B big-endian] [user data : DATA_LEN bytes] [padding]
 ```
 
-- `CMD = 0x01` (DATA): the frame carries `DATA_LEN` bytes of real user data, followed by zero or more padding bytes. The receiver writes only `DATA_LEN` bytes to the downstream.
-- `CMD = 0x00` (PADDING): pure waste frame, receiver discards the entire payload.
-
-Padding is **inside** the HMAC-authenticated region, so it is authenticated along with the user data.
+- `CMD = 0x01` (DATA): real user data followed by optional padding.
+- `CMD = 0x00` (PADDING): pure waste frame, receiver discards entirely.
 
 ### Padding Strategy
 
-Padding operates in two phases to produce a realistic traffic distribution and avoid detectable cutoff points.
-
 **Phase 1 — Initial shaping (packets 0–7):**
 
-For the first **8** data packets sent in each direction, the sender targets a random TLS record payload size chosen from traffic-profile-aware ranges:
-
-| Packet index | Target payload range | Mimics |
-|---|---|---|
-| 0 (first) | 200 – 600 bytes | HTTP request / small response |
-| 1 | 800 – 1 400 bytes (5% chance: 14 000 – 16 000) | HTTP response headers / large file |
-| 2 – 7 | 500 – 1 400 bytes (5% chance: 14 000 – 16 000) | HTTP response body chunks / large file |
-
-Packets 1–7 have a 5% probability of producing a near-full-size frame (14–16 KB), mimicking real HTTPS large file downloads that produce maximum-size TLS records.
-
-If the actual user data is already larger than the target, no padding is added (data is never truncated).
+| Packet | Target payload range | Mimics |
+|--------|---------------------|--------|
+| 0 | 200 – 600 B | HTTP request / small response |
+| 1 | 800 – 1400 B (5%: 14000 – 16000) | HTTP headers / large file |
+| 2–7 | 500 – 1400 B (5%: 14000 – 16000) | HTTP body chunks / large file |
 
 **Phase 2 — Tail padding (packets 8+):**
 
-After the initial 8 packets, each frame has a **2% probability** of receiving 0–256 bytes of random padding. This eliminates the abrupt statistical transition at the packet-8 boundary, which would otherwise serve as a detectable fingerprint.
+Each frame has a **2% probability** of 0–256 bytes of random padding, eliminating the abrupt statistical transition at the packet-8 boundary.
 
-## Security Verification
+# Security Properties
 
-1. For man-in-the-middle data tampering, the per-frame AES-128-GCM authentication tag immediately detects it and the connection is closed with a TLS Alert.
-2. For replay attacks across connections, the HKDF-derived key is bound to `ServerRandom`, making keys unique per TLS session.
-3. For replay or reorder attacks within a connection, the 64-bit sequence number in the GCM nonce ensures any out-of-order delivery fails decryption and triggers strict disconnect.
-4. For header manipulation (e.g., TLS record length tampering), the TLS record header is included as AAD in GCM, covering this attack surface.
-5. For TLS-in-TLS fingerprinting, the two-phase padding system randomises packet sizes across the entire connection lifetime, eliminating inner-protocol statistical signatures.
-6. For deep packet inspection of the inner payload, AES-128-GCM encryption ensures the inner framing (CMD, DATA_LEN, user data) is not visible even if the outer TLS encryption were somehow compromised.
+| Attack | Defense |
+|--------|---------|
+| Traffic signature detection | BoringSSL produces Chrome-identical ClientHello (JA3/JA4, X25519Kyber768, GREASE) |
+| Active probing | Failed session_id HMAC → transparent SNI proxy fallback |
+| Traffic hijacking (data) | Per-frame AES-128-GCM with direction-separated keys |
+| Cross-session replay | HKDF salt = ServerRandom (unique per session) |
+| In-session replay/reorder | 64-bit sequence number in GCM nonce |
+| Header manipulation | TLS record header as GCM AAD |
+| TLS-in-TLS fingerprinting | Two-phase padding with realistic traffic distribution |
+| Inner payload inspection | AES-128-GCM encryption (confidentiality + integrity) |
 
 # Implementation Guide
 
-## TLS Fingerprint Requirements
+## TLS Fingerprint
 
-The client **MUST** produce a TLS ClientHello identical to a real Chrome browser. This implementation uses **BoringSSL** (Chrome's actual TLS library) via the `boring` crate, which guarantees an authentic fingerprint rather than a simulation:
+The client **MUST** produce a Chrome-identical ClientHello. This implementation uses **BoringSSL** via the `boring` crate:
 
-- **TLS library**: BoringSSL (the same library used by Chrome, Android, and Cloudflare)
-- **GREASE**: Native BoringSSL GREASE (RFC 8701) — identical distribution to Chrome
-- **Cipher suites**: Chrome order (TLS 1.3: AES-128-GCM, AES-256-GCM, CHACHA20; TLS 1.2: ECDHE-ECDSA/RSA with AES-128/256-GCM and CHACHA20)
-- **Key exchange groups**: X25519Kyber768Draft00 (post-quantum), X25519, P-256, P-384 — the ~1200-byte Kyber key share is critical; without it, ClientHello is ~1000 bytes shorter than real Chrome
-- **ALPN**: `h2`, `http/1.1` (mandatory)
-- **Extensions**: Native BoringSSL extension ordering, certificate compression, and all Chrome-standard extensions
-- **Signature algorithms**: Chrome order (ECDSA+SHA256, RSA-PSS+SHA256, RSA+SHA256, ECDSA+SHA384, RSA-PSS+SHA384, RSA+SHA384, RSA-PSS+SHA512, RSA+SHA512)
+- **GREASE**: Native BoringSSL (RFC 8701)
+- **Cipher suites**: Chrome order (TLS 1.3 + TLS 1.2 ECDHE suites)
+- **Key exchange**: X25519Kyber768Draft00 (post-quantum), X25519, P-256, P-384
+- **ALPN**: `h2`, `http/1.1`
+- **Signature algorithms**: Chrome order
 - **Supported versions**: TLS 1.2, TLS 1.3
 
-Since BoringSSL IS Chrome's TLS stack, JA3/JA4 fingerprints, extension order, key share sizes, and all internal encoding details are identical to real Chrome — not simulated.
+## Client Implementation
 
-## Muddling Request
+**Stage 1 — Handshake:**
+1. Generate ClientHello via BoringSSL, save original session_id, patch with HMAC, send.
+2. Read ServerHello (handle HRR if synthetic random detected), restore session_id, extract ServerRandom.
+3. Continue handshake via BoringSSL until client flight is produced.
+4. For TLS 1.3: append random ApplicationData as synthetic Finished.
+5. Send client flight. If TLS 1.2: send fake request and bail.
 
-When V3 strict mode detects traffic hijacking (ServerRandom extraction failure or authorization failure), the client sends a realistic fake HTTP request mimicking Chrome 131:
+**Stage 2 — Data relay (no TLS library required):**
+1. Derive `key_c2s` and `key_s2c` via HKDF-SHA256(password, ServerRandom, direction).
+2. **Reading from server**: parse ApplicationData, extract 16B GCM tag, decrypt with `key_s2c`. Parse inner frame, forward user data, discard padding.
+3. **Writing to server**: build inner frame (CMD + DATA_LEN + data + padding), encrypt with `key_c2s`, wrap in ApplicationData.
 
-- Proper `User-Agent` matching the TLS fingerprint's browser version
-- Standard Chrome headers: `Accept`, `Accept-Language`, `Accept-Encoding` (gzip, deflate, br, zstd), `Sec-Fetch-*`, `Upgrade-Insecure-Requests`
-- Proper HTTP/1.1 line endings (`\r\n`)
+## Server Implementation
 
-## Client
-The client is responsible for TLS handshaking, switching and doing data encapsulation and decapsulation after the switch.
+**Stage 1 — Handshake relay (no TLS library required):**
+1. Read ClientHello, verify session_id HMAC. On failure: plain TCP relay (SNI proxy fallback).
+2. Forward ClientHello to handshake server. Read ServerHello, extract ServerRandom. Handle HRR if detected.
+3. Bidirectional relay until first AEAD-authenticated ApplicationData frame arrives from client.
+4. On AEAD match: shutdown handshake server connection, signal verbatim relay to stop.
 
-The client needs to have a built-in TLS Client and a Read Wrapper on the read side of the network stream: TLSClient <- ReadWrapper <- TCPStream; similarly, a Write Wrapper needs to be attached to the write data link: TLSClient -> WriteWrapper --> TCPStream.
-
-Stage1: TLS handshake
-Construct and sign a custom SessionID from the TLS library. 2.
-ReadWrapper. 1:
-    1. Extract ServerRandom from ServerHello; create `HMAC_ServerRandom`. 2.
-    2. Use `HMAC_ServerRandom` for ApplicationData to determine if the HMAC of the frame content (without the 4byte HMAC) matches the first 4 bytes. If it matches, rewrite the data frame content to its XOR SHA256(PreSharedKey + ServerRandom) and remove the first 4 byte HMAC value. If it does not match, no changes are made and the connection is marked as hijacked and a muddled request is sent after a successful handshake; if the handshake fails, no processing is done.
-
-Stage2: Data forwarding (this process does not rely on TLS library)
-1. Derive `key_c2s` and `key_s2c` via HKDF-SHA256 using ServerRandom as salt (28 bytes each: 16-byte AES key + 12-byte base nonce).
-2. Parse ApplicationData frames when reading from the server connection. Extract the 16-byte GCM tag and decrypt the ciphertext using `key_s2c`, constructing the nonce as `base_nonce XOR seq_be64`.
-    1. If GCM passes (state = AuthPending): transition to Authenticated, parse the decrypted inner frame, extract `DATA_LEN` bytes of user data (discard padding), forward to user.
-    2. If GCM passes (state = Authenticated): same as above. Pure padding frames (`CMD=0x00`) are silently discarded.
-    3. If GCM fails (state = AuthPending): this may be a residual handshake frame (NewSessionTicket etc.); discard silently. Resource limits apply (64 KiB / 10 s).
-    4. If GCM fails (state = Authenticated): strict disconnect — send TLS Alert and close.
-    Note: The Server is allowed to send residual TLS frames after the Client has switched; the Client filters them during the AuthPending state.
-3. When writing to the server connection, build the inner frame (CMD + DATA_LEN + data + padding), encrypt with AES-128-GCM using `key_c2s` and `base_nonce XOR seq_be64`, wrap in ApplicationData with the GCM tag. Apply two-phase padding.
-
-## Server-side
-The server is responsible for forwarding the TLS handshake, determining the timing of the switch, and encapsulating and decapsulating the data after the switch, without relying on the TLS library.
-
-Stage1: Forwarding the TLS handshake
-1. Read ClientHello: extract and identify the SessionID in ClientHello, if it does not pass, mark it as active detection traffic and start TCP forwarding directly (if it implements multiple SNIs, it also needs to resolve the SNIs and do the corresponding splitting and forwarding); if it passes, it also forwards the data frame and continues to the second step.
-2. Read ServerHello from the other side: extract ServerRandom.
-Start two-way forwarding (with Handshake Server).
-    1. Create `HMAC_ServerRandomC` and `HMAC_ServerRandom`.
-    2. ShadowTLS Client -> Handshake Server: Forward directly until a frame matching the first 4 bytes of ApplicationData matches the `HMAC_ServerRandomC` signature is encountered, then stop forwarding in both directions (but ensure the integrity of the frames remaining in transit).
-    3. Handshake Server -> ShadowTLS Client: modify the Application Data frame by doing XOR SHA256 (PreSharedKey + ServerRandom) on the data and adding 4 byte HMAC in the header (calculated by `HMAC_ ServerRandom`).
-
-Stage2: Data forwarding (with Data Server)
-1. Derive `key_c2s` and `key_s2c` via HKDF-SHA256 using ServerRandom as salt (28 bytes each: 16-byte AES key + 12-byte base nonce).
-2. ShadowTLS Client → Data Server: Parse ApplicationData, extract 16-byte GCM tag, decrypt ciphertext using `key_c2s` and `base_nonce XOR seq_be64`. Any authentication failure is treated as Alert bad_record_mac. On success, parse the decrypted inner frame, extract the real user data bytes (discarding padding), and forward to the Data Server.
-3. Data Server → ShadowTLS Client: Build inner frame, encrypt with AES-128-GCM using `key_s2c`, wrap in ApplicationData with GCM tag. Apply two-phase padding to all frames.
+**Stage 2 — Data relay:**
+1. Derive `key_c2s` and `key_s2c` via HKDF-SHA256(password, ServerRandom, direction).
+2. **Client → Data Server**: decrypt with `key_c2s`, parse inner frame, forward user data.
+3. **Data Server → Client**: encrypt with `key_s2c`, build inner frame, apply padding.
