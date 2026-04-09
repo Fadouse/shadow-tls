@@ -8,9 +8,21 @@ use monoio::buf::IoBufMut;
 use monoio::io::{AsyncReadRentExt, AsyncWriteRentExt};
 use monoio::net::TcpStream;
 use rand::Rng;
+use std::time::Duration;
 
 use crate::util::prelude::*;
 use crate::util::Hmac;
+
+/// Overall timeout for the entire handshake phase.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// TLS 1.3 HelloRetryRequest uses this fixed synthetic ServerRandom (RFC 8446 §4.1.3).
+pub(crate) const HRR_RANDOM: [u8; 32] = [
+    0xCF, 0x21, 0xAD, 0x74, 0xE5, 0x9A, 0x61, 0x11,
+    0xBE, 0x1D, 0x8C, 0x02, 0x1E, 0x65, 0xB8, 0x91,
+    0xC2, 0xA2, 0x11, 0x16, 0x7A, 0xBB, 0x8C, 0x5E,
+    0x07, 0x9E, 0x09, 0xE2, 0xC8, 0xA8, 0x33, 0x9C,
+];
 
 // ---------------------------------------------------------------------------
 // Chrome TLS Configuration
@@ -282,6 +294,17 @@ fn extract_server_random_raw(frame: &[u8]) -> Option<[u8; TLS_RANDOM_SIZE]> {
     Some(sr)
 }
 
+/// Read exactly one TLS record from TCP with a timeout.
+async fn read_tls_frame_timeout(tcp: &mut TcpStream, timeout: Duration) -> io::Result<Vec<u8>> {
+    match monoio::time::timeout(timeout, read_tls_frame(tcp)).await {
+        Ok(r) => r,
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "handshake read timed out",
+        )),
+    }
+}
+
 /// Read exactly one TLS record from TCP (header + body).
 async fn read_tls_frame(tcp: &mut TcpStream) -> io::Result<Vec<u8>> {
     let header = vec![0u8; TLS_HEADER_SIZE];
@@ -373,44 +396,93 @@ pub(crate) async fn perform_v3_handshake(
             "failed to patch ClientHello session_id",
         ));
     }
+    // Save the patched session_id for HRR reuse (RFC 8446 §4.1.2:
+    // "The client MUST use the same legacy_session_id in the retry ClientHello")
+    let patched_sid = save_session_id(&client_hello).unwrap();
 
     // Phase 3: Send patched ClientHello
     let (res, _) = tcp.write_all(client_hello).await;
     res?;
 
-    // Phase 4: Read ServerHello, extract ServerRandom and TLS version
-    let mut server_hello = read_tls_frame(tcp).await?;
-    let server_random = extract_server_random_raw(&server_hello).ok_or_else(|| {
+    // Phase 4: Read ServerHello, handle HelloRetryRequest (HRR)
+    let mut server_hello = read_tls_frame_timeout(tcp, HANDSHAKE_TIMEOUT).await?;
+    let mut server_random = extract_server_random_raw(&server_hello).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             "failed to extract ServerRandom from ServerHello",
         )
     })?;
-    let tls13 = crate::util::support_tls13(&server_hello);
-    tracing::debug!("ServerHello received (tls1.3={tls13})");
+    let mut original_sid = original_sid;
 
-    // Phase 5: Restore original session_id in ServerHello for boring.
-    // boring verifies the echoed session_id matches what it sent — without
-    // this restore, boring would return DECODE_ERROR.
+    // Restore original session_id and feed to boring
     restore_server_hello_session_id(&mut server_hello, &original_sid);
     mid.get_mut().feed(&server_hello);
 
-    // Phase 6: Continue handshake with boring, feeding server frames and
-    // collecting boring's client flight output.
-    //
-    // TLS 1.3: boring processes ServerHello → writes CCS → reads CCS from
-    //   server → reads encrypted extensions → FAILS (BAD_DECRYPT, expected).
-    //   We get CCS from boring.
-    //
-    // TLS 1.2: boring processes ServerHello → Certificate → ServerKeyExchange →
-    //   ServerHelloDone → writes CKE + CCS + Finished → wants server CCS.
-    //   We get the full client flight from boring.
+    // Handle HRR: boring needs to produce a new ClientHello
+    if server_random == HRR_RANDOM {
+        tracing::debug!("HelloRetryRequest detected, producing new ClientHello");
+        match mid.handshake() {
+            Err(HandshakeError::WouldBlock(mut new_mid)) => {
+                let mut pending = new_mid.get_mut().take_write_buf();
+                if !pending.is_empty() {
+                    // HRR: CH2 must carry the same session_id as CH1 (RFC 8446 §4.1.2).
+                    // Save boring's new original for restoring in the real ServerHello,
+                    // then overwrite with the patched sid from CH1.
+                    if pending.len() >= SESSION_ID_OFFSET + TLS_SESSION_ID_SIZE {
+                        if let Some(new_sid) = save_session_id(&pending) {
+                            original_sid = new_sid;
+                        }
+                        pending[SESSION_ID_OFFSET..SESSION_ID_OFFSET + TLS_SESSION_ID_SIZE]
+                            .copy_from_slice(&patched_sid);
+                    }
+                    let (res, _) = tcp.write_all(pending).await;
+                    res?;
+                }
+                mid = new_mid;
+            }
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "unexpected handshake completion during HRR",
+                ))
+            }
+            Err(e) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("HRR handshake error: {e}"),
+                ))
+            }
+        }
+
+        // Read the real ServerHello after HRR
+        server_hello = read_tls_frame_timeout(tcp, HANDSHAKE_TIMEOUT).await?;
+        server_random = extract_server_random_raw(&server_hello).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "failed to extract ServerRandom after HRR",
+            )
+        })?;
+        if server_random == HRR_RANDOM {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "server sent double HelloRetryRequest",
+            ));
+        }
+        restore_server_hello_session_id(&mut server_hello, &original_sid);
+        mid.get_mut().feed(&server_hello);
+    }
+
+    let tls13 = crate::util::support_tls13(&server_hello);
+    tracing::debug!("ServerHello received (tls1.3={tls13})");
+
+    // Phase 6: Continue handshake — feed server frames, collect client flight
     let mut client_flight = Vec::new();
     let mut client_flight_flushed: usize = 0;
-    // TLS 1.2 with large cert chains can produce many records (cert chain
-    // fragmented across multiple TLS records + ServerKeyExchange + ServerHelloDone).
-    // 20 is generous enough for real-world servers.
-    const MAX_FRAMES: usize = 20;
+    // TLS 1.2 with large cert chains can produce many records. Use a byte
+    // budget instead of a fixed record count to handle fragmented flights.
+    const MAX_FRAMES: usize = 40;
+    const MAX_HANDSHAKE_BYTES: usize = 256 * 1024; // 256 KiB total handshake data
+    let mut handshake_bytes: usize = 0;
     let mut completed = false;
 
     for _ in 0..MAX_FRAMES {
@@ -446,7 +518,14 @@ pub(crate) async fn perform_v3_handshake(
                 }
 
                 // Read another server frame from TCP and feed to boring
-                let frame = read_tls_frame(tcp).await?;
+                let frame = read_tls_frame_timeout(tcp, HANDSHAKE_TIMEOUT).await?;
+                handshake_bytes += frame.len();
+                if handshake_bytes > MAX_HANDSHAKE_BYTES {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        format!("handshake exceeded byte budget ({MAX_HANDSHAKE_BYTES} bytes)"),
+                    ));
+                }
                 new_mid.get_mut().feed(&frame);
                 mid = new_mid;
             }
@@ -461,6 +540,15 @@ pub(crate) async fn perform_v3_handshake(
                     // We verify boring progressed far enough to send CCS
                     // (client_flight_flushed > 0) — if it failed before producing
                     // any output, it's a genuine error (bad params, client-auth, etc).
+                    let err_lower = err_str.to_lowercase();
+                    let is_decrypt_error = err_lower.contains("decrypt")
+                        || err_lower.contains("bad_record_mac")
+                        || err_lower.contains("mac");
+                    if !is_decrypt_error {
+                        tracing::warn!(
+                            "TLS 1.3: non-decrypt failure after CCS ({client_flight_flushed} bytes flushed): {err_str}"
+                        );
+                    }
                     tracing::debug!(
                         "boring handshake terminated (expected for TLS 1.3): {err_str}"
                     );
@@ -486,10 +574,7 @@ pub(crate) async fn perform_v3_handshake(
         ));
     }
 
-    // Phase 7: For TLS 1.3, boring produces CCS but can't produce the encrypted
-    // Finished (can't decrypt server's flight → can't compute Finished hash).
-    // Append a random ApplicationData record — encrypted data is indistinguishable
-    // from random to passive observers and DPI systems.
+    // Phase 7: TLS 1.3 — append random ApplicationData as synthetic Finished
     if tls13 && !contains_application_data(&client_flight) {
         append_random_finished(&mut client_flight);
     }

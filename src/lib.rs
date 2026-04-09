@@ -126,6 +126,7 @@ impl Runnable {
         // 8 threads are enough for resolving domains
         const MAX_BLOCKING_THREADS: usize = 8;
 
+        assert!(parallelism > 0, "parallelism must be at least 1");
         let mut threads = Vec::new();
         let shared_pool =
             monoio::blocking::DefaultThreadPool::new(MAX_BLOCKING_THREADS.min(2 * parallelism));

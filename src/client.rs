@@ -24,6 +24,7 @@ pub struct ShadowTlsClient {
     password: Arc<String>,
     nodelay: bool,
     fastopen: bool,
+    v3: V3Mode,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -144,7 +145,7 @@ impl ShadowTlsClient {
         password: String,
         nodelay: bool,
         fastopen: bool,
-        _v3: V3Mode,
+        v3: V3Mode,
     ) -> anyhow::Result<Self> {
         let alpn = tls_ext_config.alpn.unwrap_or_default();
         let ssl_connector = boring_tls::build_chrome_ssl_connector(&alpn)
@@ -158,6 +159,7 @@ impl ShadowTlsClient {
             password: Arc::new(password),
             nodelay,
             fastopen,
+            v3,
         })
     }
 
@@ -203,9 +205,20 @@ impl ShadowTlsClient {
                 .await?;
 
         if !tls13 {
-            tracing::warn!("TLS 1.3 not supported, sending fake request and aborting");
+            // TLS 1.2: BoringSSL's Finished has wrong transcript hash, so the
+            // handshake server will reject it. All modes bail here because:
+            //   - Strict: explicitly rejects TLS 1.2
+            //   - Lossy/Disabled: can't produce valid AEAD relay (server-side
+            //     strict stays in bidirectional proxy mode, not data relay)
+            // Send a fake request to complete a realistic traffic pattern.
+            let mode_name = match self.v3 {
+                V3Mode::Strict => "strict",
+                V3Mode::Lossy => "lossy",
+                V3Mode::Disabled => "disabled",
+            };
+            tracing::warn!("TLS 1.3 not supported ({mode_name} mode), sending fake request and aborting");
             boring_tls::fake_request_and_drain(&mut stream, sni).await?;
-            bail!("TLS 1.3 is not supported");
+            bail!("TLS 1.3 is not supported ({mode_name} mode)");
         }
 
         // Client flight (CCS + encrypted Finished) was already sent by

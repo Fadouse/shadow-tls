@@ -18,7 +18,7 @@ use hkdf::Hkdf;
 use hmac::Mac;
 use rand::Rng;
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 
 use prelude::*;
 
@@ -374,24 +374,6 @@ pub(crate) fn parse_inner_frame(inner: &[u8]) -> Option<(u8, &[u8])> {
     Some((cmd, &inner[INNER_HEADER_SIZE..INNER_HEADER_SIZE + data_len]))
 }
 
-#[inline]
-#[allow(dead_code)]
-pub(crate) fn xor_slice(data: &mut [u8], key: &[u8]) {
-    data.iter_mut()
-        .zip(key.iter().cycle())
-        .for_each(|(d, k)| *d ^= k);
-}
-
-#[inline]
-#[allow(dead_code)]
-pub(crate) fn kdf(password: &str, server_random: &[u8]) -> Vec<u8> {
-    let mut hasher = Sha256::new();
-    hasher.update(password.as_bytes());
-    hasher.update(server_random);
-    let hash = hasher.finalize();
-    hash.to_vec()
-}
-
 pub(crate) async fn verified_relay(
     raw: TcpStream,
     tls: TcpStream,
@@ -529,7 +511,7 @@ async fn copy_remove_appdata_and_decrypt(
         let frame = match maybe_frame {
             Some(frame) => frame,
             None => {
-                // EOF
+                // EOF — let encrypt side finish via raw_write.shutdown() + FIN
                 return;
             }
         };
@@ -557,6 +539,7 @@ async fn copy_remove_appdata_and_decrypt(
                     }
                     continue;
                 }
+                // Authenticated: let encrypt side finish via half-close
                 return;
             }
             APPLICATION_DATA => {

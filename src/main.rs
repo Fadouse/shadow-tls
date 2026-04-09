@@ -158,9 +158,15 @@ fn read_config_file(filename: String) -> Args {
 impl From<Args> for RunningArgs {
     fn from(args: Args) -> Self {
         let v3 = match (args.opts.v3, args.opts.strict) {
-            (true, true) => V3Mode::Strict,
+            (_, true) => {
+                // --strict implies --v3
+                if !args.opts.v3 {
+                    tracing::warn!("--strict implies --v3, enabling V3 protocol");
+                }
+                V3Mode::Strict
+            }
             (true, false) => V3Mode::Lossy,
-            (false, _) => V3Mode::Disabled,
+            (false, false) => V3Mode::Disabled,
         };
 
         match args.cmd {
@@ -247,14 +253,30 @@ pub(crate) fn get_sip003_arg() -> Option<Args> {
         exit(-1);
     });
 
-    let opts = parse_sip003_options(&ss_plugin_options).unwrap();
+    let opts = match parse_sip003_options(&ss_plugin_options) {
+        Ok(o) => o,
+        Err(e) => {
+            tracing::error!("failed to parse SS_PLUGIN_OPTIONS: {e}");
+            exit(-1);
+        }
+    };
     let opts: HashMap<_, _> = opts.into_iter().collect();
 
-    let threads = opts.get("threads").map(|s| s.parse::<u8>().unwrap());
+    let threads = opts.get("threads").and_then(|s| match s.parse::<u8>() {
+        Ok(n) => Some(n),
+        Err(e) => {
+            tracing::error!("invalid threads value: {e}");
+            exit(-1);
+        }
+    });
     let v3 = opts.contains_key("v3");
-    let passwd = opts
-        .get("passwd")
-        .expect("need passwd param(like passwd=123456)");
+    let passwd = match opts.get("passwd") {
+        Some(p) => p,
+        None => {
+            tracing::error!("need passwd param (like passwd=123456)");
+            exit(-1);
+        }
+    };
 
     let args_opts = crate::Opts {
         threads,
@@ -262,16 +284,30 @@ pub(crate) fn get_sip003_arg() -> Option<Args> {
         ..Default::default()
     };
     let args = if opts.contains_key("server") {
-        let tls_addr = opts
-            .get("tls")
-            .expect("tls param must be specified(like tls=xxx.com:443)");
-        let tls_addrs = parse_server_addrs(tls_addr)
-            .expect("tls param parse failed(like tls=xxx.com:443 or tls=yyy.com:1.2.3.4:443;zzz.com:443;xxx.com)");
-        let wildcard_sni = WildcardSNI::from_str(
+        let tls_addr = match opts.get("tls") {
+            Some(t) => t,
+            None => {
+                tracing::error!("tls param must be specified (like tls=xxx.com:443)");
+                exit(-1);
+            }
+        };
+        let tls_addrs = match parse_server_addrs(tls_addr) {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::error!("tls param parse failed: {e}");
+                exit(-1);
+            }
+        };
+        let wildcard_sni = match WildcardSNI::from_str(
             opts.get("wildcard-sni").map(AsRef::as_ref).unwrap_or("off"),
             true,
-        )
-        .expect("wildcard_sni format error");
+        ) {
+            Ok(w) => w,
+            Err(e) => {
+                tracing::error!("wildcard_sni format error: {e}");
+                exit(-1);
+            }
+        };
         Args {
             cmd: crate::Commands::Server {
                 listen: format!("{ss_remote_host}:{ss_remote_port}"),
@@ -283,10 +319,20 @@ pub(crate) fn get_sip003_arg() -> Option<Args> {
             opts: args_opts,
         }
     } else {
-        let host = opts
-            .get("host")
-            .expect("need host param(like host=www.baidu.com)");
-        let hosts = parse_client_names(host).expect("tls names parse failed");
+        let host = match opts.get("host") {
+            Some(h) => h,
+            None => {
+                tracing::error!("need host param (like host=www.baidu.com)");
+                exit(-1);
+            }
+        };
+        let hosts = match parse_client_names(host) {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::error!("tls names parse failed: {e}");
+                exit(-1);
+            }
+        };
         Args {
             cmd: crate::Commands::Client {
                 listen: format!("{ss_local_host}:{ss_local_port}"),
@@ -307,8 +353,7 @@ fn main() {
         .with(
             EnvFilter::builder()
                 .with_default_directive(LevelFilter::INFO.into())
-                .from_env_lossy()
-                .add_directive("rustls=off".parse().unwrap()),
+                .from_env_lossy(),
         )
         .init();
     let mut args = get_sip003_arg().unwrap_or_else(Args::parse);

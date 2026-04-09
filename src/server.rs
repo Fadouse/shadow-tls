@@ -65,6 +65,58 @@ impl TlsAddrs {
     }
 }
 
+/// Parse a single address part from the TLS address list.
+/// Supports formats: `host`, `host:port`, `key:host:port`, `[ipv6]:port`, `key:[ipv6]:port`
+fn parse_addr_part(part: &str) -> anyhow::Result<(String, String, String)> {
+    // Handle bracketed IPv6: find ] first
+    if let Some(bracket_end) = part.find(']') {
+        let bracket_start = part.find('[').ok_or_else(|| {
+            anyhow::anyhow!("mismatched brackets in address: {part}")
+        })?;
+        let ipv6 = &part[bracket_start + 1..bracket_end];
+        let before = &part[..bracket_start];
+        let after = &part[bracket_end + 1..];
+
+        let key = if before.ends_with(':') {
+            before.trim_end_matches(':').to_string()
+        } else {
+            String::new()
+        };
+
+        let port = if after.starts_with(':') {
+            after[1..].to_string()
+        } else {
+            "443".to_string()
+        };
+
+        let host = format!("[{ipv6}]");
+        let key = if key.is_empty() { host.clone() } else { key };
+        return Ok((key, host, port));
+    }
+
+    // Non-IPv6: split by ':'
+    let parts: Vec<&str> = part.split(':').collect();
+    match parts.len() {
+        1 => {
+            // host only
+            Ok((parts[0].to_string(), parts[0].to_string(), "443".to_string()))
+        }
+        2 => {
+            // host:port or key:host
+            if parts[1].parse::<u16>().is_ok() {
+                Ok((parts[0].to_string(), parts[0].to_string(), parts[1].to_string()))
+            } else {
+                Ok((parts[0].to_string(), parts[1].to_string(), "443".to_string()))
+            }
+        }
+        3 => {
+            // key:host:port
+            Ok((parts[0].to_string(), parts[1].to_string(), parts[2].to_string()))
+        }
+        _ => anyhow::bail!("unrecognized server addrs part: {part}"),
+    }
+}
+
 impl TryFrom<&str> for TlsAddrs {
     type Error = anyhow::Error;
 
@@ -74,34 +126,19 @@ impl TryFrom<&str> for TlsAddrs {
             .next()
             .and_then(|x| if x.trim().is_empty() { None } else { Some(x) })
             .ok_or_else(|| anyhow::anyhow!("empty server addrs"))?;
-        let fallback = if !fallback.contains(':') {
-            format!("{fallback}:443")
-        } else {
+        let fallback = if fallback.contains('[') || fallback.contains(':') {
+            // Already has port or is IPv6
             fallback.to_string()
+        } else {
+            format!("{fallback}:443")
         };
 
         let mut dispatch = rustc_hash::FxHashMap::default();
         for p in rev_parts {
-            let mut p = p.trim().split(':').rev();
-            let mut port = Cow::<'static, str>::Borrowed("443");
-            let maybe_port = p
-                .next()
-                .ok_or_else(|| anyhow::anyhow!("empty part found in server addrs"))?;
-            let host = if maybe_port.parse::<u16>().is_ok() {
-                // there is a port at the end
-                port = maybe_port.into();
-                p.next()
-                    .ok_or_else(|| anyhow::anyhow!("no host found in server addrs part"))?
-            } else {
-                maybe_port
-            };
-            let key = match p.next() {
-                Some(key) => key,
-                None => host,
-            };
-            if p.next().is_some() {
-                bail!("unrecognized server addrs part");
-            }
+            let part = p.trim();
+            // Parse host:port supporting IPv6 bracket notation [::1]:443
+            // Format: [key:]host[:port] where host may be [ipv6]
+            let (key, host, port) = parse_addr_part(part)?;
             if dispatch
                 .insert(key.to_string(), format!("{host}:{port}"))
                 .is_some()
@@ -204,7 +241,7 @@ impl ShadowTlsServer {
         let first_server_frame = read_exact_frame(&mut handshake_stream).await?;
         let (res, first_server_frame) = in_stream.write_all(first_server_frame).await;
         res?;
-        let server_random = match extract_server_random(&first_server_frame) {
+        let mut server_random = match extract_server_random(&first_server_frame) {
             Some(sr) => sr,
             None => {
                 // we cannot extract server random, bidirectional copy and return
@@ -214,6 +251,34 @@ impl ShadowTlsServer {
             }
         };
         tracing::debug!("Client authenticated. ServerRandom extracted: {server_random:?}");
+
+        // Handle HelloRetryRequest: if the first server frame is HRR (synthetic random),
+        // relay the retry ClientHello and read the real ServerHello to get the actual random.
+        // Without this, client and server derive different AEAD keys on HRR paths.
+        if server_random == crate::boring_tls::HRR_RANDOM {
+            tracing::debug!("HelloRetryRequest detected on server side, relaying retry");
+            // Read retry ClientHello from shadow-tls client → forward to handshake server
+            let retry_client_hello = read_exact_frame(&mut in_stream).await?;
+            let (res, _) = handshake_stream.write_all(retry_client_hello).await;
+            res?;
+            // Read real ServerHello from handshake server → forward to shadow-tls client
+            let real_server_hello = read_exact_frame(&mut handshake_stream).await?;
+            let (res, real_server_hello) = in_stream.write_all(real_server_hello).await;
+            res?;
+            server_random = match extract_server_random(&real_server_hello) {
+                Some(sr) => sr,
+                None => {
+                    tracing::warn!("ServerRandom extract failed after HRR, will copy bidirectional");
+                    copy_bidirectional(in_stream, handshake_stream).await;
+                    return Ok(());
+                }
+            };
+            if server_random == crate::boring_tls::HRR_RANDOM {
+                tracing::error!("double HelloRetryRequest, aborting");
+                return Ok(());
+            }
+            tracing::debug!("Real ServerRandom extracted after HRR: {server_random:?}");
+        }
 
         let use_tls13 = support_tls13(&first_server_frame);
         if self.v3.strict() && !use_tls13 {
@@ -239,7 +304,7 @@ impl ShadowTlsServer {
         let (mut c_read, mut c_write) = in_stream.into_split();
         let pure_data = {
             let (mut h_read, mut h_write) = handshake_stream.into_split();
-            let (mut stop_tx, mut stop_rx) = local_sync::oneshot::channel::<()>();
+            let (mut stop_tx, stop_rx) = local_sync::oneshot::channel::<()>();
             let (maybe_pure, _) = monoio::join!(
                 async {
                     let r = copy_by_frame_until_aead_matches(
@@ -251,6 +316,10 @@ impl ShadowTlsServer {
                     // Shutdown write to handshake server (TCP FIN). Handshake server
                     // processes ClientFinished, sends NewSessionTickets, then closes.
                     let _ = h_write.shutdown().await;
+                    // Drop the receiver to signal verbatim relay to stop immediately.
+                    // This unblocks stop_tx.closed() in copy_by_frame_verbatim,
+                    // avoiding a 30s idle timeout wait.
+                    drop(stop_rx);
                     r
                 },
                 async {
@@ -265,9 +334,6 @@ impl ShadowTlsServer {
                     // Do NOT shutdown c_write — the client TCP continues in data phase.
                 }
             );
-            // After verbatim relay ends (handshake server EOF), close the stop channel
-            // to let any pending safety logic terminate.
-            stop_rx.close();
             match maybe_pure {
                 Ok(ref data) => tracing::trace!("aead match ok, pure_data len={}", data.len()),
                 Err(ref e) => tracing::warn!("aead match failed: {e}"),
@@ -434,43 +500,91 @@ async fn copy_by_frame_until_aead_matches(
     mut write: impl AsyncWriteRent,
     aead: &mut FrameAead,
 ) -> std::io::Result<Vec<u8>> {
+    /// Max time waiting for the first authenticated data frame.
+    /// Generous to accommodate browser preconnects and idle SOCKS tunnels.
+    const STAGE1_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+    /// Max bytes forwarded to handshake server before giving up.
+    const STAGE1_MAX_BYTES: usize = 256 * 1024;
+
+    let deadline = std::time::Instant::now() + STAGE1_TIMEOUT;
     let mut g_buffer = Vec::new();
-    let mut aead_matched = false;
+    let mut aead_active = false;
+    let mut forwarded_bytes: usize = 0;
 
     loop {
-        let buffer = read_exact_frame_into(&mut read, g_buffer).await?;
+        // Enforce time budget
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "stage-1: timed out waiting for first authenticated data frame",
+            ));
+        }
+        let buffer = match monoio::time::timeout(
+            remaining,
+            read_exact_frame_into(&mut read, g_buffer),
+        )
+        .await
+        {
+            Ok(r) => r?,
+            Err(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "stage-1: timed out waiting for first authenticated data frame",
+                ));
+            }
+        };
+
         if buffer.len() > TLS_HMAC_HEADER_SIZE && buffer[0] == APPLICATION_DATA {
             let header: [u8; TLS_HEADER_SIZE] =
                 buffer[..TLS_HEADER_SIZE].try_into().unwrap();
             let mut tag = [0u8; HMAC_SIZE];
             tag.copy_from_slice(&buffer[TLS_HEADER_SIZE..TLS_HMAC_HEADER_SIZE]);
 
-            if !aead_matched {
-                // Decrypt in-place: copy ciphertext to mutable buffer
-                let mut payload = buffer[TLS_HMAC_HEADER_SIZE..].to_vec();
-                aead_matched = aead.decrypt_and_advance(&header, &mut payload, &tag);
-
-                if aead_matched {
-                    // Parse inner framing from decrypted plaintext
-                    match crate::util::parse_inner_frame(&payload) {
-                        Some((CMD_DATA, data)) if !data.is_empty() => {
-                            return Ok(data.to_vec());
-                        }
-                        Some((CMD_PADDING, _)) | Some((CMD_DATA, _)) => {
-                            g_buffer = buffer;
-                            continue;
-                        }
-                        _ => {
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::InvalidData,
-                                "malformed inner frame in AEAD-matched packet",
-                            ));
-                        }
+            // Always try to decrypt — don't latch on first match
+            let mut payload = buffer[TLS_HMAC_HEADER_SIZE..].to_vec();
+            if aead.decrypt_and_advance(&header, &mut payload, &tag) {
+                aead_active = true;
+                // Parse inner framing from decrypted plaintext
+                match crate::util::parse_inner_frame(&payload) {
+                    Some((CMD_DATA, data)) if !data.is_empty() => {
+                        return Ok(data.to_vec());
+                    }
+                    Some((CMD_PADDING, _)) | Some((CMD_DATA, _)) => {
+                        // Valid AEAD frame but padding/empty — keep reading
+                        g_buffer = buffer;
+                        continue;
+                    }
+                    _ => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "malformed inner frame in AEAD-matched packet",
+                        ));
                     }
                 }
+            } else if aead_active {
+                // After first AEAD success, all frames must authenticate
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "AEAD verification failed after authentication",
+                ));
             }
+        } else if aead_active {
+            // After authentication, non-ApplicationData frames are unexpected
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "unexpected non-ApplicationData frame after authentication",
+            ));
         }
 
+        // Pre-authentication: forward to handshake server
+        forwarded_bytes += buffer.len();
+        if forwarded_bytes > STAGE1_MAX_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "stage-1: byte budget exceeded waiting for first authenticated frame",
+            ));
+        }
         let (res, buffer) = write.write_all(buffer).await;
         res?;
         g_buffer = buffer;
