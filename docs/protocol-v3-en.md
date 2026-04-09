@@ -129,6 +129,20 @@ Wire format:
 - **Strict sequence policy**: after authentication, any GCM failure = immediate disconnect.
 - **AuthPending limits**: before first valid GCM frame, non-matching frames are discarded (max 64 KiB, max 10 seconds).
 
+## TLS Record Compliance
+
+All constructed ApplicationData frames **strictly respect the 16384-byte standard TLS fragment limit**:
+
+```
+TLS record payload = GCM tag(16) + inner header(3) + data + padding ≤ 16384
+```
+
+- **MAX_DATA_PER_FRAME** = 16384 − 16 − 3 = **16365 bytes**
+- Each read is capped at MAX_DATA_PER_FRAME; padding is additionally clamped
+- Mux mode: MAX_MUX_DATA = 16384 − 16 − 7 (mux frame header) = **16361 bytes**
+
+**Why this matters**: TLS records exceeding 16384 bytes violate RFC 8446. Network middleboxes (firewalls, NAT, DPI) may silently truncate oversized records, causing frame misalignment and GCM verification failures. High-throughput scenarios (e.g., speedtest) are particularly sensitive.
+
 ## Inner Framing (Anti TLS-in-TLS)
 
 Each encrypted payload carries a 3-byte inner header to prevent statistical fingerprinting of the inner protocol:
@@ -166,6 +180,56 @@ Each frame has a **5% probability** of 0–512 bytes of random padding, eliminat
 | Header manipulation | TLS record header as GCM AAD |
 | TLS-in-TLS fingerprinting | Two-phase padding with realistic traffic distribution |
 | Inner payload inspection | AES-128-GCM encryption (confidentiality + integrity) |
+| Oversized TLS record truncation | All frames strictly ≤ 16384-byte standard limit |
+| Mux session hang | Dead session auto-detection + shutdown clears all streams |
+
+# Multiplexing (Mux)
+
+## Architecture
+
+Mux allows multiple logical streams to share a single TLS tunnel, eliminating handshake overhead for subsequent connections (0 additional RTT):
+
+```
+sslocal conn 1 ──┐                              ┌── ssserver conn 1
+sslocal conn 2 ──┼── shadow-tls client ═══ TLS ═══ shadow-tls server ──┼── ssserver conn 2
+sslocal conn 3 ──┘     (mux write/read)          (mux dispatch)   └── ssserver conn 3
+```
+
+## Mux Frame Format (inside AEAD-encrypted inner payload)
+
+```
+CMD_MUX_SYN    = 0x02  [4B stream_id] [2B initial_window_kb]
+CMD_MUX_DATA   = 0x03  [4B stream_id] [2B data_len] [data]
+CMD_MUX_FIN    = 0x04  [4B stream_id]
+CMD_MUX_RST    = 0x05  [4B stream_id]
+```
+
+Multiple mux frames may be coalesced into a single TLS record, up to MAX_INNER_PAYLOAD (16368 bytes).
+
+## Session Lifecycle
+
+1. **Creation**: first connection establishes TLS tunnel, creates MuxSession, starts read/write loops.
+2. **Reuse**: subsequent connections obtain a live session from MuxPool via `open_stream()`.
+3. **Health check**: `MuxSession.is_alive()` checks the `dead` flag; `has_capacity()` checks both liveness and stream count.
+4. **Death & cleanup**: when read/write loop exits, `shutdown()` is called:
+   - Sets `dead = true`
+   - Clears all stream data channels (`streams.clear()`), causing blocked `data_rx.recv()` to return `None` immediately
+   - `MuxPool.cleanup()` removes all dead sessions
+5. **Recreation**: next connection finding no live session automatically establishes a new TLS tunnel.
+
+## AuthPending (client-side)
+
+The client mux read loop starts in AuthPending state, silently discarding handshake residue frames (NewSessionTickets, alerts) until the first valid AEAD frame arrives. Limits: 64 KiB / 10 seconds. The server side does not need this (handshake drain completes before mux dispatch).
+
+# io_uring Safety
+
+This implementation uses monoio (io_uring async runtime). io_uring's completion-based I/O does not support safely cancelling in-flight read operations (the buffer has been submitted to the kernel).
+
+**Design principle**: never cancel in-flight reads via `select!`.
+
+- **Encrypt write loops**: complete the read first, then check alert flag (not select! race)
+- **Verbatim drain relay**: check stop signal and deadline after completing each read
+- **Coalescing**: sleep before read (not cancel after read)
 
 # Implementation Guide
 

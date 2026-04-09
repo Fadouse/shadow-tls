@@ -129,6 +129,20 @@ ciphertext || tag = AES-128-GCM(key, nonce, AAD=tls_header, plaintext)
 - **严格序号策略**：认证后任何 GCM 失败 = 立即断连。
 - **AuthPending 限制**：首个有效 GCM 帧前，不匹配帧静默丢弃（上限 64 KiB / 10 秒）。
 
+## TLS Record 合规
+
+所有构造的 ApplicationData 帧**严格遵守 16384 字节标准 TLS fragment 上限**：
+
+```
+TLS record payload = GCM tag(16) + 内层头(3) + 数据 + 填充 ≤ 16384
+```
+
+- **MAX_DATA_PER_FRAME** = 16384 − 16 − 3 = **16365 字节**
+- 单次读取限制为 MAX_DATA_PER_FRAME，填充量额外 clamp
+- Mux 模式：MAX_MUX_DATA = 16384 − 16 − 7（mux 帧头） = **16361 字节**
+
+**重要性**：超过 16384 字节的 TLS record 不符合 RFC 8446 标准。网络中间设备（防火墙、NAT、DPI）可能静默截断超大 record，导致帧错位和 GCM 验证失败。高吞吐场景（如 speedtest）尤为敏感。
+
 ## 内层帧（反 TLS-in-TLS）
 
 每个加密 payload 携带 3 字节内层头，防止内层协议统计指纹：
@@ -166,6 +180,56 @@ ciphertext || tag = AES-128-GCM(key, nonce, AAD=tls_header, plaintext)
 | 头部篡改 | TLS 记录头作为 GCM AAD |
 | TLS-in-TLS 指纹 | 两阶段填充，模拟真实流量分布 |
 | 内层 payload 检测 | AES-128-GCM 加密（机密性 + 完整性） |
+| TLS record 超长截断 | 所有帧严格 ≤ 16384 字节标准上限 |
+| Mux session 卡死 | 死 session 自动检测 + shutdown 清理所有 stream |
+
+# 多路复用 (Mux)
+
+## 架构
+
+Mux 允许多个逻辑流共享单条 TLS 隧道，消除后续连接的握手开销（0 额外 RTT）：
+
+```
+sslocal conn 1 ──┐                              ┌── ssserver conn 1
+sslocal conn 2 ──┼── shadow-tls client ═══ TLS ═══ shadow-tls server ──┼── ssserver conn 2
+sslocal conn 3 ──┘     (mux write/read)          (mux dispatch)   └── ssserver conn 3
+```
+
+## Mux 帧格式（加密内层 payload 内）
+
+```
+CMD_MUX_SYN    = 0x02  [4B stream_id] [2B initial_window_kb]
+CMD_MUX_DATA   = 0x03  [4B stream_id] [2B data_len] [data]
+CMD_MUX_FIN    = 0x04  [4B stream_id]
+CMD_MUX_RST    = 0x05  [4B stream_id]
+```
+
+多个 mux 帧可合并到单个 TLS record（coalescing），上限 MAX_INNER_PAYLOAD（16368 字节）。
+
+## Session 生命周期
+
+1. **创建**：首个连接建立 TLS 隧道，创建 MuxSession，启动 read/write 循环。
+2. **复用**：后续连接通过 MuxPool 获取存活 session，调用 `open_stream()` 创建新流。
+3. **健康检测**：`MuxSession.is_alive()` 检查 `dead` 标志；`has_capacity()` 同时检查存活和流数量。
+4. **死亡与清理**：read/write 循环退出时调用 `shutdown()`：
+   - 设置 `dead = true`
+   - 清空所有 stream 的数据通道（`streams.clear()`），使阻塞的 `data_rx.recv()` 立即返回 `None`
+   - `MuxPool.cleanup()` 移除所有死 session
+5. **新建**：下次连接发现无存活 session 时自动建立新 TLS 隧道。
+
+## AuthPending（客户端侧）
+
+客户端 mux read loop 启动时处于 AuthPending 状态，静默丢弃握手残留帧（NewSessionTickets、alerts），直到首个有效 AEAD 帧到达。上限 64 KiB / 10 秒。服务端不需要（handshake drain 在 mux dispatch 前已完成）。
+
+# io_uring 安全
+
+本实现使用 monoio（io_uring 异步运行时）。io_uring 的 completion-based I/O 不支持安全取消 in-flight 读操作（buffer 已提交给内核）。
+
+**设计原则**：不在 `select!` 中取消正在进行的读操作。
+
+- **加密写循环**：先完成 read，再检查 alert 标志（而非 select! 竞争）
+- **verbatim drain**：完成 read 后检查 stop 信号和 deadline
+- **coalescing**：在 read 前 sleep（而非 read 后 cancel）
 
 # 实现指南
 

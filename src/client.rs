@@ -292,7 +292,7 @@ impl ShadowTlsClient {
             // Client app -> mux stream
             async {
                 let mut in_read = in_read;
-                let mut buf = vec![0u8; 16384];
+                let mut buf = vec![0u8; crate::mux::MAX_MUX_DATA];
                 loop {
                     let (res, b) = in_read.read(buf).await;
                     buf = b;

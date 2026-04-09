@@ -37,6 +37,9 @@ use crate::util::{mod_tcp_conn, resolve, FrameAead, PaddingState};
 
 /// Default initial per-stream receive window (256 KiB).
 const DEFAULT_STREAM_WINDOW: u32 = 256 * 1024;
+/// Max data bytes per MuxFrame::Data to keep the TLS record within 16384 bytes.
+/// MuxFrame::Data header = 1 (cmd) + 4 (stream_id) + 2 (data_len) = 7 bytes.
+pub(crate) const MAX_MUX_DATA: usize = MAX_INNER_PAYLOAD - 7;
 /// Max streams per mux session.
 const DEFAULT_MAX_STREAMS: usize = 128;
 /// Idle timeout for a mux session with no active streams.
@@ -182,12 +185,33 @@ pub(crate) struct MuxSession {
     next_stream_id: Cell<u32>,
     /// Number of active (non-closed) streams.
     active_count: Cell<usize>,
+    /// Set to true when the session's read or write loop dies.
+    dead: Cell<bool>,
 }
 
 impl MuxSession {
+    /// Check if this session is still alive (read/write loops running).
+    pub(crate) fn is_alive(&self) -> bool {
+        !self.dead.get()
+    }
+
     /// Check if this session can accept more streams.
     pub(crate) fn has_capacity(&self) -> bool {
-        self.active_count.get() < DEFAULT_MAX_STREAMS
+        self.is_alive() && self.active_count.get() < DEFAULT_MAX_STREAMS
+    }
+
+    /// Mark session as dead and close all stream data channels so that
+    /// any blocked `data_rx.recv()` returns `None` immediately.
+    pub(crate) fn shutdown(&self) {
+        if self.dead.get() {
+            return;
+        }
+        self.dead.set(true);
+        // Drop all stream data_tx senders → unblocks data_rx.recv()
+        let mut streams = self.streams.borrow_mut();
+        streams.clear();
+        self.active_count.set(0);
+        tracing::debug!("mux session shut down, all streams closed");
     }
 
     /// Open a new client-initiated stream. Returns the stream ID and a
@@ -318,11 +342,11 @@ impl MuxPool {
         self.sessions.borrow_mut().push(session);
     }
 
-    /// Remove sessions with no active streams.
+    /// Remove dead sessions and sessions with no active streams.
     pub(crate) fn cleanup(&self) {
         self.sessions
             .borrow_mut()
-            .retain(|s| s.active_count.get() > 0);
+            .retain(|s| s.is_alive() && s.active_count.get() > 0);
     }
 
     pub(crate) fn at_capacity(&self) -> bool {
@@ -345,12 +369,14 @@ pub(crate) async fn mux_write_loop(
     mut tls_write: impl monoio::io::AsyncWriteRent,
     mut rx: local_sync::mpsc::unbounded::Rx<MuxFrame>,
     mut aead: FrameAead,
+    session: Rc<MuxSession>,
 ) {
     use std::ptr::copy_nonoverlapping;
 
     let mut buffer = Vec::with_capacity(32768);
     let mut padding = PaddingState::new();
 
+    let result: () = async {
     loop {
         // Wait for at least one frame
         let first = match rx.recv().await {
@@ -383,9 +409,11 @@ pub(crate) async fn mux_write_loop(
         // Append the inner payload (will be encrypted)
         buffer.extend_from_slice(&inner);
 
-        // Add padding
+        // Add padding (clamped so TLS record payload stays ≤ 16384)
         let current_payload = HMAC_SIZE + inner.len();
-        let pad_len = padding.next_padding_len(current_payload);
+        let mut pad_len = padding.next_padding_len(current_payload);
+        let max_pad = MAX_INNER_PAYLOAD.saturating_sub(inner.len());
+        pad_len = pad_len.min(max_pad);
         if pad_len > 0 {
             buffer.resize(buffer.len() + pad_len, 0);
             rand::Rng::fill(&mut rand::thread_rng(), &mut buffer[TLS_HMAC_HEADER_SIZE + inner.len()..]);
@@ -414,6 +442,10 @@ pub(crate) async fn mux_write_loop(
             return;
         }
     }
+    }.await;
+    // Write loop exiting — mark session dead and unblock all streams
+    let _ = result;
+    session.shutdown();
 }
 
 // ---------------------------------------------------------------------------
@@ -422,16 +454,43 @@ pub(crate) async fn mux_write_loop(
 
 /// Runs the mux read loop: reads AEAD-encrypted TLS ApplicationData records,
 /// decrypts them, parses mux frames, and dispatches to the appropriate stream.
+///
+/// `auth_pending`: if true, discard frames that fail AEAD until the first valid
+/// frame (drains verbatim handshake residue like NewSessionTickets). Once
+/// authenticated, any AEAD failure is fatal. On the server side this is false
+/// because the handshake drain happens before mux dispatch.
 pub(crate) async fn mux_read_loop(
     tls_read: impl monoio::io::AsyncReadRent,
     session: Rc<MuxSession>,
     mut aead: FrameAead,
+    auth_pending: bool,
+) {
+    mux_read_loop_inner(tls_read, &session, &mut aead, auth_pending).await;
+    // Read loop exiting — mark session dead and unblock all streams
+    session.shutdown();
+}
+
+async fn mux_read_loop_inner(
+    tls_read: impl monoio::io::AsyncReadRent,
+    session: &MuxSession,
+    aead: &mut FrameAead,
+    auth_pending: bool,
 ) {
     use crate::util::BufferFrameDecoder;
     const INIT_BUFFER_SIZE: usize = 4096;
+    /// Max bytes/time discarded during auth-pending phase.
+    const AUTH_PENDING_MAX_BYTES: usize = 64 * 1024;
+    const AUTH_PENDING_MAX_SECS: u64 = 10;
 
     let mut decoder = BufferFrameDecoder::new(tls_read, INIT_BUFFER_SIZE);
     let mut decrypt_buf: Vec<u8> = Vec::with_capacity(16384);
+    let mut authenticated = !auth_pending;
+    let mut pending_bytes_discarded: usize = 0;
+    let auth_deadline = if auth_pending {
+        Some(std::time::Instant::now() + std::time::Duration::from_secs(AUTH_PENDING_MAX_SECS))
+    } else {
+        None
+    };
 
     loop {
         let maybe_frame = match decoder.next().await {
@@ -446,8 +505,27 @@ pub(crate) async fn mux_read_loop(
             None => return, // EOF
         };
 
+        // Check auth-pending deadline
+        if !authenticated {
+            if let Some(dl) = auth_deadline {
+                if std::time::Instant::now() >= dl {
+                    tracing::warn!("mux auth pending: time limit exceeded");
+                    return;
+                }
+            }
+        }
+
         if frame[0] != APPLICATION_DATA || frame.len() < TLS_HMAC_HEADER_SIZE {
-            continue; // Skip non-ApplicationData (alerts, etc.)
+            if !authenticated {
+                // AuthPending: discard non-ApplicationData (CCS, alerts, etc.)
+                pending_bytes_discarded += frame.len();
+                if pending_bytes_discarded > AUTH_PENDING_MAX_BYTES {
+                    tracing::warn!("mux auth pending: byte limit exceeded");
+                    return;
+                }
+                continue;
+            }
+            continue;
         }
 
         let header: [u8; TLS_HEADER_SIZE] = frame[..TLS_HEADER_SIZE].try_into().unwrap();
@@ -458,8 +536,23 @@ pub(crate) async fn mux_read_loop(
         decrypt_buf.extend_from_slice(&frame[TLS_HMAC_HEADER_SIZE..]);
 
         if !aead.decrypt_and_advance(&header, &mut decrypt_buf, &tag) {
+            if !authenticated {
+                // AuthPending: discard non-AEAD frames (NewSessionTickets etc.)
+                pending_bytes_discarded += frame.len();
+                if pending_bytes_discarded > AUTH_PENDING_MAX_BYTES {
+                    tracing::warn!("mux auth pending: byte limit exceeded");
+                    return;
+                }
+                tracing::debug!("mux auth pending: discarding non-AEAD frame");
+                continue;
+            }
             tracing::warn!("mux: AEAD verification failed");
             return;
+        }
+
+        if !authenticated {
+            tracing::debug!("mux auth pending → authenticated");
+            authenticated = true;
         }
 
         // Parse all mux frames from the decrypted payload (coalesced)
@@ -500,6 +593,7 @@ pub(crate) async fn mux_server_dispatch(
         streams: streams.clone(),
         next_stream_id: Cell::new(2), // server uses even IDs (reserved)
         active_count: Cell::new(0),
+        dead: Cell::new(false),
     });
 
     let (tls_read, tls_write) = tls.into_split();
@@ -584,7 +678,7 @@ pub(crate) async fn mux_server_dispatch(
     });
 
     // Run the write loop in the current task
-    mux_write_loop(tls_write, write_rx, aead_encrypt).await;
+    mux_write_loop(tls_write, write_rx, aead_encrypt, session.clone()).await;
 
     Ok(())
 }
@@ -628,8 +722,7 @@ fn spawn_server_stream(
             // Data server -> mux stream (read from data server, send via mux)
             async {
                 let mut data_read = data_read;
-                let buf = vec![0u8; 16384];
-                let mut buf = buf;
+                let mut buf = vec![0u8; MAX_MUX_DATA];
                 loop {
                     let (res, b) = data_read.read(buf).await;
                     buf = b;
@@ -680,16 +773,18 @@ pub(crate) fn create_client_session(
         streams: streams.clone(),
         next_stream_id: Cell::new(1), // client uses odd IDs
         active_count: Cell::new(0),
+        dead: Cell::new(false),
     });
 
     let (tls_read, tls_write) = tls.into_split();
 
     // Spawn write loop
-    monoio::spawn(mux_write_loop(tls_write, write_rx, aead_encrypt));
+    monoio::spawn(mux_write_loop(tls_write, write_rx, aead_encrypt, session.clone()));
 
     // Spawn read loop
     let session_for_read = session.clone();
-    monoio::spawn(mux_read_loop(tls_read, session_for_read, aead_decrypt));
+    // Client side: auth_pending=true to drain handshake residue (NewSessionTickets etc.)
+    monoio::spawn(mux_read_loop(tls_read, session_for_read, aead_decrypt, true));
 
     session
 }

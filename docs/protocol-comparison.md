@@ -24,10 +24,11 @@
 
 | 指标 | ShadowTLS (本项目) | 原版 ShadowTLS | AnyTLS | REALITY | Hysteria 2 | Naiveproxy | Meek |
 |------|:--:|:--:|:--:|:--:|:--:|:--:|:--:|
-| **首连握手 RTT** | 1.5 | 1.5 | 1 | 1 | 1 | 1-2 | 3-5 |
+| **首连握手 RTT** | 1 (TFO) / 1.5 | 1.5 | 1 | 1 | 1 | 1-2 | 3-5 |
+| **后续连接 RTT (Mux)** | **0** | N/A | 0 | 0 | 0 | 0 | 0 |
 | **HRR 时握手 RTT** | 3.5 | 失败 (bug) | 2 | 2 | N/A | 2-3 | N/A |
-| **多路复用** | 有 (Mux) | 无 | 有 | 可选 | 原生 (QUIC) | 有 (HTTP/2) | 有 (HTTP) |
-| **0-RTT 恢复** | TFO | TFO | TLS Resume | 无 | QUIC 0-RTT | TLS Resume | 无 |
+| **多路复用** | 有 (Mux + 生命周期管理) | 无 | 有 | 可选 | 原生 (QUIC) | 有 (HTTP/2) | 有 (HTTP) |
+| **0-RTT 恢复** | TFO + Mux | TFO | TLS Resume | 无 | QUIC 0-RTT | TLS Resume | 无 |
 | **吞吐量上限** | 极高 | 高 | 高 | 高 | 极高 | 中 | 极低 |
 | **有损网络性能** | 中 (TCP) | 中 | 中 | 中 | 极高 (Brutal) | 中 | 差 |
 | **内存开销 / 连接** | ~33 KB | ~17 KB | ~20 KB | ~20 KB | ~50 KB | ~2 MB | ~10 KB |
@@ -36,7 +37,7 @@
 ### 要点说明
 
 - **Hysteria 2** 在高丢包链路上性能最强, Brutal 拥塞控制无视丢包以用户设定带宽恒速发送
-- **ShadowTLS** 使用 Rust + io_uring, 单连接开销最低; 新增多路复用后消除了 per-connection 握手开销
+- **ShadowTLS** 使用 Rust + io_uring, 单连接开销最低; 多路复用消除 per-connection 握手开销 (后续连接 0 RTT); TLS record 严格 ≤16384 字节确保中间设备兼容; session 生命周期管理防止连接卡死
 - **Naiveproxy** 因内嵌 Chromium 网络栈, 内存开销约为其他协议的 50-100 倍
 - **Meek** 基于 HTTP 轮询, 吞吐量仅约 50-200 KB/s, 延迟 200-2000 ms
 

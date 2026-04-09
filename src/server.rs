@@ -647,28 +647,39 @@ async fn copy_by_frame_verbatim(
     const DRAIN_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
     let mut g_buffer = Vec::new();
-    let stop = stop.closed();
-    let mut stop = std::pin::pin!(stop);
+    let deadline = std::time::Instant::now() + DRAIN_IDLE_TIMEOUT;
 
+    // io_uring safety: read_exact_frame_into is uncancelable — dropping it
+    // while io_uring holds the buffer causes UAF. Instead of racing with
+    // select!, complete the read and check the stop signal + deadline after.
     loop {
-        monoio::select! {
-            // this function can be stopped by a channel when reading.
-            _ = &mut stop => {
-                return Ok(());
-            },
-            buffer_res = read_exact_frame_into(&mut read, g_buffer) => {
-                let buffer = buffer_res?;
-                tracing::trace!("h2c frame: type=0x{:02x}, len={}", buffer[0], buffer.len());
-                // writing is not cancelable
-                let (res, buffer) = write.write_all(buffer).await;
-                res?;
-                g_buffer = buffer;
-            },
-            _ = monoio::time::sleep(DRAIN_IDLE_TIMEOUT) => {
+        if stop.is_closed() {
+            return Ok(());
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            tracing::warn!("drain relay: idle timeout ({DRAIN_IDLE_TIMEOUT:?}), stopping");
+            return Ok(());
+        }
+        let buffer_res = match monoio::time::timeout(
+            remaining,
+            read_exact_frame_into(&mut read, g_buffer),
+        ).await {
+            Ok(r) => r,
+            Err(_) => {
                 tracing::warn!("drain relay: idle timeout ({DRAIN_IDLE_TIMEOUT:?}), stopping");
                 return Ok(());
             }
+        };
+        // Check stop signal after completing the read
+        if stop.is_closed() {
+            return Ok(());
         }
+        let buffer = buffer_res?;
+        tracing::trace!("h2c frame: type=0x{:02x}, len={}", buffer[0], buffer.len());
+        let (res, buffer) = write.write_all(buffer).await;
+        res?;
+        g_buffer = buffer;
     }
 }
 

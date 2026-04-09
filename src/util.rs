@@ -746,6 +746,15 @@ async fn copy_remove_appdata_and_decrypt(
 /// padded frame during the initial phase.
 const ENCRYPT_BUF_SIZE: usize = 16384 + FRAME_OVERHEAD + 16384;
 
+/// Max data bytes per read to keep TLS record payload ≤ 16384 bytes.
+///
+/// TLS record payload = HMAC_SIZE(16) + inner_header(3) + data + padding.
+/// We cap data reads so that even without padding the record stays within
+/// the standard TLS fragment limit (16384). Middleboxes and firewalls may
+/// silently drop or truncate records exceeding this limit, causing frame
+/// misalignment and GCM verification failures under high throughput.
+const MAX_DATA_PER_FRAME: usize = 16384 - HMAC_SIZE - INNER_HEADER_SIZE;
+
 async fn copy_add_appdata_and_encrypt(
     mut read: impl AsyncReadRent,
     mut write: impl AsyncWriteRent,
@@ -761,67 +770,65 @@ async fn copy_add_appdata_and_encrypt(
     buffer[2] = TLS_MINOR.0;
 
     let mut padding = PaddingState::new();
-    let alert_notified = alert_notified.closed();
-    let mut alert_notified = std::pin::pin!(alert_notified);
 
+    // io_uring safety: never race a read against alert_notified in select!.
+    // Dropping an in-flight io_uring read leaks the buffer. Instead, complete
+    // the read first and check the alert flag after each iteration.
     loop {
-        monoio::select! {
-            _ = &mut alert_notified => {
-                send_alert(&mut write, alert_enabled).await;
-                return;
-            },
-            (res, buf) = read.read(buffer.slice_mut(FRAME_OVERHEAD..)) => {
-                if matches!(res, Ok(0) | Err(_)) {
-                    send_alert(&mut write, alert_enabled).await;
-                    return;
-                }
-                buffer = buf.into_inner();
-                let data_len = buffer.len() - FRAME_OVERHEAD;
+        let (res, buf) = read.read(buffer.slice_mut(FRAME_OVERHEAD..FRAME_OVERHEAD + MAX_DATA_PER_FRAME)).await;
+        if matches!(res, Ok(0) | Err(_)) || alert_notified.is_closed() {
+            buffer = buf.into_inner();
+            send_alert(&mut write, alert_enabled).await;
+            return;
+        }
+        buffer = buf.into_inner();
+        let data_len = buffer.len() - FRAME_OVERHEAD;
 
-                // Write inner header: CMD_DATA + data_len
-                buffer[TLS_HMAC_HEADER_SIZE] = CMD_DATA;
-                buffer[TLS_HMAC_HEADER_SIZE + 1] = (data_len >> 8) as u8;
-                buffer[TLS_HMAC_HEADER_SIZE + 2] = data_len as u8;
+        // Write inner header: CMD_DATA + data_len
+        buffer[TLS_HMAC_HEADER_SIZE] = CMD_DATA;
+        buffer[TLS_HMAC_HEADER_SIZE + 1] = (data_len >> 8) as u8;
+        buffer[TLS_HMAC_HEADER_SIZE + 2] = data_len as u8;
 
-                // Add padding (initial-phase target sizing or tail-phase random)
-                let current_payload = HMAC_SIZE + INNER_HEADER_SIZE + data_len;
-                let pad_len = padding.next_padding_len(current_payload);
-                if pad_len > 0 {
-                    buffer.resize(buffer.len() + pad_len, 0);
-                    rand::thread_rng().fill(&mut buffer[FRAME_OVERHEAD + data_len..]);
-                }
+        // Add padding (initial-phase target sizing or tail-phase random)
+        let current_payload = HMAC_SIZE + INNER_HEADER_SIZE + data_len;
+        let mut pad_len = padding.next_padding_len(current_payload);
+        // Clamp padding so TLS record payload stays ≤ 16384
+        let max_pad = MAX_DATA_PER_FRAME.saturating_sub(data_len);
+        pad_len = pad_len.min(max_pad);
+        if pad_len > 0 {
+            buffer.resize(buffer.len() + pad_len, 0);
+            rand::thread_rng().fill(&mut buffer[FRAME_OVERHEAD + data_len..]);
+        }
 
-                // Write TLS record length (before encryption, since it's AAD)
-                let frame_len = buffer.len() - TLS_HEADER_SIZE;
-                (&mut buffer[3..5])
-                    .write_u16::<BigEndian>(frame_len as u16)
-                    .unwrap();
+        // Write TLS record length (before encryption, since it's AAD)
+        let frame_len = buffer.len() - TLS_HEADER_SIZE;
+        (&mut buffer[3..5])
+            .write_u16::<BigEndian>(frame_len as u16)
+            .unwrap();
 
-                // AES-128-GCM encrypt inner payload in-place, get 16-byte tag
-                let header: [u8; TLS_HEADER_SIZE] =
-                    buffer[..TLS_HEADER_SIZE].try_into().unwrap();
-                let tag = aead.encrypt_and_advance(
-                    &header,
-                    &mut buffer[TLS_HMAC_HEADER_SIZE..],
-                );
-                unsafe {
-                    copy_nonoverlapping(
-                        tag.as_ptr(),
-                        buffer.as_mut_ptr().add(TLS_HEADER_SIZE),
-                        HMAC_SIZE,
-                    )
-                };
+        // AES-128-GCM encrypt inner payload in-place, get 16-byte tag
+        let header: [u8; TLS_HEADER_SIZE] =
+            buffer[..TLS_HEADER_SIZE].try_into().unwrap();
+        let tag = aead.encrypt_and_advance(
+            &header,
+            &mut buffer[TLS_HMAC_HEADER_SIZE..],
+        );
+        unsafe {
+            copy_nonoverlapping(
+                tag.as_ptr(),
+                buffer.as_mut_ptr().add(TLS_HEADER_SIZE),
+                HMAC_SIZE,
+            )
+        };
 
-                let (res, buf) = write.write_all(buffer).await;
-                buffer = buf;
+        let (res, buf) = write.write_all(buffer).await;
+        buffer = buf;
 
-                // Reset buffer for next iteration
-                unsafe { buffer.set_len(FRAME_OVERHEAD) };
+        // Reset buffer for next iteration
+        unsafe { buffer.set_len(FRAME_OVERHEAD) };
 
-                if res.is_err() {
-                    return;
-                }
-            }
+        if res.is_err() {
+            return;
         }
     }
 }
@@ -852,81 +859,67 @@ async fn copy_add_appdata_coalesced(
     buffer[2] = TLS_MINOR.0;
 
     let mut padding = PaddingState::new();
-    let alert_notified = alert_notified.closed();
-    let mut alert_notified = std::pin::pin!(alert_notified);
     let coalesce_dur = Duration::from_millis(coalesce_ms);
-    /// Skip coalescing delay for chunks larger than this (already efficient).
-    const COALESCE_THRESHOLD: usize = 4096;
     let mut packet_count: usize = 0;
 
+    // io_uring safety: complete the read before checking alert, same as
+    // copy_add_appdata_and_encrypt. Coalescing delay is applied BEFORE the
+    // read so it naturally batches TCP data without cancelling in-flight ops.
     loop {
-        // Coalescing delay: after the initial padding phase, insert a brief
-        // sleep before reading. This lets the kernel's TCP receive buffer
-        // accumulate data from the inner protocol, so the next read returns
-        // a larger chunk (fewer, bigger TLS records).
-        // Skip for the first packet (padding handles initial shaping) and
-        // for large chunks (already efficiently sized).
         if packet_count > 0 {
             monoio::time::sleep(coalesce_dur).await;
         }
 
-        monoio::select! {
-            _ = &mut alert_notified => {
-                send_alert(&mut write, alert_enabled).await;
-                return;
-            },
-            (res, buf) = read.read(buffer.slice_mut(FRAME_OVERHEAD..)) => {
-                if matches!(res, Ok(0) | Err(_)) {
-                    send_alert(&mut write, alert_enabled).await;
-                    return;
-                }
-                buffer = buf.into_inner();
-                let data_len = buffer.len() - FRAME_OVERHEAD;
-                packet_count += 1;
-
-                // Write inner header: CMD_DATA + data_len
-                buffer[TLS_HMAC_HEADER_SIZE] = CMD_DATA;
-                buffer[TLS_HMAC_HEADER_SIZE + 1] = (data_len >> 8) as u8;
-                buffer[TLS_HMAC_HEADER_SIZE + 2] = data_len as u8;
-
-                // Add padding
-                let current_payload = HMAC_SIZE + INNER_HEADER_SIZE + data_len;
-                let pad_len = padding.next_padding_len(current_payload);
-                if pad_len > 0 {
-                    buffer.resize(buffer.len() + pad_len, 0);
-                    rand::thread_rng().fill(&mut buffer[FRAME_OVERHEAD + data_len..]);
-                }
-
-                // Write TLS record length
-                let frame_len = buffer.len() - TLS_HEADER_SIZE;
-                (&mut buffer[3..5])
-                    .write_u16::<BigEndian>(frame_len as u16)
-                    .unwrap();
-
-                // Encrypt
-                let header: [u8; TLS_HEADER_SIZE] =
-                    buffer[..TLS_HEADER_SIZE].try_into().unwrap();
-                let tag = aead.encrypt_and_advance(
-                    &header,
-                    &mut buffer[TLS_HMAC_HEADER_SIZE..],
-                );
-                unsafe {
-                    copy_nonoverlapping(
-                        tag.as_ptr(),
-                        buffer.as_mut_ptr().add(TLS_HEADER_SIZE),
-                        HMAC_SIZE,
-                    )
-                };
-
-                let (res, buf) = write.write_all(buffer).await;
-                buffer = buf;
-                unsafe { buffer.set_len(FRAME_OVERHEAD) };
-
-                if res.is_err() {
-                    return;
-                }
-            }
+        let (res, buf) = read.read(buffer.slice_mut(FRAME_OVERHEAD..FRAME_OVERHEAD + MAX_DATA_PER_FRAME)).await;
+        if matches!(res, Ok(0) | Err(_)) || alert_notified.is_closed() {
+            buffer = buf.into_inner();
+            send_alert(&mut write, alert_enabled).await;
+            return;
         }
+        buffer = buf.into_inner();
+        let data_len = buffer.len() - FRAME_OVERHEAD;
+        packet_count += 1;
+
+        // Write inner header: CMD_DATA + data_len
+        buffer[TLS_HMAC_HEADER_SIZE] = CMD_DATA;
+        buffer[TLS_HMAC_HEADER_SIZE + 1] = (data_len >> 8) as u8;
+        buffer[TLS_HMAC_HEADER_SIZE + 2] = data_len as u8;
+
+        // Add padding
+        let current_payload = HMAC_SIZE + INNER_HEADER_SIZE + data_len;
+        let mut pad_len = padding.next_padding_len(current_payload);
+        // Clamp padding so TLS record payload stays ≤ 16384
+        let max_pad = MAX_DATA_PER_FRAME.saturating_sub(data_len);
+        pad_len = pad_len.min(max_pad);
+        if pad_len > 0 {
+            buffer.resize(buffer.len() + pad_len, 0);
+            rand::thread_rng().fill(&mut buffer[FRAME_OVERHEAD + data_len..]);
+        }
+
+        // Write TLS record length
+        let frame_len = buffer.len() - TLS_HEADER_SIZE;
+        (&mut buffer[3..5])
+            .write_u16::<BigEndian>(frame_len as u16)
+            .unwrap();
+
+        // Encrypt
+        let header: [u8; TLS_HEADER_SIZE] =
+            buffer[..TLS_HEADER_SIZE].try_into().unwrap();
+        let tag = aead.encrypt_and_advance(
+            &header,
+            &mut buffer[TLS_HMAC_HEADER_SIZE..],
+        );
+        unsafe {
+            copy_nonoverlapping(
+                tag.as_ptr(),
+                buffer.as_mut_ptr().add(TLS_HEADER_SIZE),
+                HMAC_SIZE,
+            )
+        };
+
+        let (res, buf) = write.write_all(buffer).await;
+        buffer = buf;
+        unsafe { buffer.set_len(FRAME_OVERHEAD) };
     }
 }
 

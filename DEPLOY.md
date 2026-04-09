@@ -30,6 +30,9 @@ ssserver (Shadowsocks 服务端)
 - 帧合并 (Coalescing): 减少小帧数量，产出更接近真实 HTTPS 的 TLS 记录模式
 - NewSessionTickets 逐字转发，不修改帧长度 (绕过 aparecium 类检测)
 - **多路复用 (Mux)**: 多个连接共享一条 TLS 隧道，减少握手开销，天然打散流量模式
+- **TLS record 合规**: 所有帧严格遵守 16384 字节标准 TLS fragment 上限，避免中间设备截断
+- **io_uring 安全**: 避免在 select! 中取消 in-flight io_uring 读操作，防止 buffer 生命周期问题
+- **Mux session 生命周期管理**: 死 session 自动检测和清理，防止连接卡死
 
 ---
 
@@ -99,7 +102,7 @@ ssserver -s "127.0.0.1:8388" \
 ### 2.2 启动 ShadowTLS 服务端
 
 ```bash
-shadow-tls --v3 --strict --mux server \
+shadow-tls --v3 --strict --mux --fastopen server \
     --listen "[::]:443" \
     --server "127.0.0.1:8388" \
     --tls "www.google.com" \
@@ -109,12 +112,14 @@ shadow-tls --v3 --strict --mux server \
 参数说明：
 - `--v3 --strict`: 启用 V3 协议严格模式 (仅 TLS 1.3，最安全)
 - `--mux`: 启用多路复用 (多连接共享单条 TLS 隧道，减少握手开销)
+- `--fastopen`: 启用 TCP Fast Open (减少 1 RTT 连接延迟)
 - `--listen "[::]:443"`: 监听所有接口的 443 端口 (对外伪装 HTTPS)
 - `--server "127.0.0.1:8388"`: 内部 Shadowsocks 服务端地址
 - `--tls "www.google.com"`: 握手伪装目标
 - `--password`: ShadowTLS 认证密码
 
 > **提示**: `--mux` 需客户端和服务端同时启用。不加 `--mux` 时行为与旧版完全兼容。
+> **提示**: `--fastopen` 需内核支持 (sysctl `net.ipv4.tcp_fastopen >= 3`)。
 
 ### 2.3 systemd 服务 (推荐)
 
@@ -143,7 +148,7 @@ Requires=ssserver.service
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/shadow-tls --v3 --strict --mux server --listen "[::]:443" --server "127.0.0.1:8388" --tls "www.google.com" --password "YOUR_STLS_PASSWORD"
+ExecStart=/usr/local/bin/shadow-tls --v3 --strict --mux --fastopen server --listen "[::]:443" --server "127.0.0.1:8388" --tls "www.google.com" --password "YOUR_STLS_PASSWORD"
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=65536
@@ -165,7 +170,7 @@ sudo systemctl status shadow-tls
 ### 3.1 启动 ShadowTLS 客户端
 
 ```bash
-shadow-tls --v3 --strict --mux client \
+shadow-tls --v3 --strict --mux --fastopen client \
     --listen "127.0.0.1:1443" \
     --server "YOUR_VPS_IP:443" \
     --sni "www.google.com" \
@@ -177,6 +182,7 @@ shadow-tls --v3 --strict --mux client \
 - `--server "YOUR_VPS_IP:443"`: 服务端 ShadowTLS 地址
 - `--sni "www.google.com"`: 必须与服务端 `--tls` 一致
 - `--mux`: 启用多路复用 (必须与服务端一致)
+- `--fastopen`: 启用 TCP Fast Open (必须与服务端一致)
 - `--password`: 必须与服务端一致
 
 ### 3.2 启动 Shadowsocks 客户端
@@ -349,10 +355,10 @@ RUST_LOG=debug shadow-tls --v3 --strict server ...
 ```bash
 # === 服务端 (VPS) ===
 ssserver -s 127.0.0.1:8388 -m 2022-blake3-aes-128-gcm -k "$SS_PASSWORD" &
-shadow-tls --v3 --strict --mux server --listen [::]:443 --server 127.0.0.1:8388 --tls www.google.com --password "$STLS_PASSWORD" &
+shadow-tls --v3 --strict --mux --fastopen server --listen [::]:443 --server 127.0.0.1:8388 --tls www.google.com --password "$STLS_PASSWORD" &
 
 # === 客户端 (本地) ===
-shadow-tls --v3 --strict --mux client --listen 127.0.0.1:1443 --server VPS_IP:443 --sni www.google.com --password "$STLS_PASSWORD" &
+shadow-tls --v3 --strict --mux --fastopen client --listen 127.0.0.1:1443 --server VPS_IP:443 --sni www.google.com --password "$STLS_PASSWORD" &
 sslocal -b 127.0.0.1:1080 -s 127.0.0.1:1443 -m 2022-blake3-aes-128-gcm -k "$SS_PASSWORD" &
 
 # === 测试 ===
@@ -360,3 +366,4 @@ curl --socks5 127.0.0.1:1080 http://captive.apple.com/
 ```
 
 > **不使用多路复用**: 去掉 `--mux` 即可回退到每连接独立 TLS 隧道模式，与旧版完全兼容。
+> **不使用 TCP Fast Open**: 去掉 `--fastopen` 即可，适用于不支持 TFO 的环境。
