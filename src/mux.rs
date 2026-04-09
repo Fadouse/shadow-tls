@@ -22,7 +22,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use byteorder::{BigEndian, WriteBytesExt};
 use monoio::io::{AsyncReadRent, AsyncReadRentExt, AsyncWriteRent, AsyncWriteRentExt, Splitable};
@@ -185,6 +185,9 @@ pub(crate) struct MuxSession {
     next_stream_id: Cell<u32>,
     /// Number of active (non-closed) streams.
     active_count: Cell<usize>,
+    /// When the session last became idle (no active streams).
+    /// `None` means it currently has at least one active stream.
+    idle_since: Cell<Option<Instant>>,
     /// Set to true when the session's read or write loop dies.
     dead: Cell<bool>,
 }
@@ -227,6 +230,9 @@ impl MuxSession {
             data_tx,
             state: StreamState::Open,
         });
+        if self.active_count.get() == 0 {
+            self.idle_since.set(None);
+        }
         self.active_count.set(self.active_count.get() + 1);
 
         // Send SYN to peer
@@ -267,7 +273,11 @@ impl MuxSession {
         self.streams.borrow_mut().remove(&stream_id);
         let count = self.active_count.get();
         if count > 0 {
-            self.active_count.set(count - 1);
+            let new_count = count - 1;
+            self.active_count.set(new_count);
+            if new_count == 0 {
+                self.idle_since.set(Some(Instant::now()));
+            }
         }
     }
 
@@ -321,6 +331,9 @@ impl MuxSession {
 pub(crate) struct MuxPool {
     sessions: RefCell<Vec<Rc<MuxSession>>>,
     max_sessions: usize,
+    /// Serializes session creation so concurrent connections don't each
+    /// independently create their own TLS session (thundering herd).
+    creating: Cell<bool>,
 }
 
 impl MuxPool {
@@ -328,6 +341,7 @@ impl MuxPool {
         Self {
             sessions: RefCell::new(Vec::new()),
             max_sessions,
+            creating: Cell::new(false),
         }
     }
 
@@ -337,22 +351,40 @@ impl MuxPool {
         sessions.iter().find(|s| s.has_capacity()).cloned()
     }
 
+    /// Try to acquire the creation lock. Returns true if this caller
+    /// should create a session, false if another task is already creating.
+    pub(crate) fn try_lock_create(&self) -> bool {
+        if self.creating.get() {
+            return false;
+        }
+        self.creating.set(true);
+        true
+    }
+
+    pub(crate) fn unlock_create(&self) {
+        self.creating.set(false);
+    }
+
     /// Register a new session.
     pub(crate) fn add_session(&self, session: Rc<MuxSession>) {
         self.sessions.borrow_mut().push(session);
     }
 
-    /// Remove dead sessions and sessions with no active streams.
+    /// Remove dead sessions and sessions idle longer than MUX_IDLE_TIMEOUT.
     pub(crate) fn cleanup(&self) {
-        self.sessions
-            .borrow_mut()
-            .retain(|s| s.is_alive() && s.active_count.get() > 0);
-    }
-
-    pub(crate) fn at_capacity(&self) -> bool {
-        let sessions = self.sessions.borrow();
-        sessions.len() >= self.max_sessions
-            && sessions.iter().all(|s| !s.has_capacity())
+        let now = Instant::now();
+        self.sessions.borrow_mut().retain(|s| {
+            if !s.is_alive() {
+                return false;
+            }
+            if s.active_count.get() == 0 {
+                return s
+                    .idle_since
+                    .get()
+                    .is_some_and(|t| now.duration_since(t) < MUX_IDLE_TIMEOUT);
+            }
+            true
+        });
     }
 }
 
@@ -593,6 +625,7 @@ pub(crate) async fn mux_server_dispatch(
         streams: streams.clone(),
         next_stream_id: Cell::new(2), // server uses even IDs (reserved)
         active_count: Cell::new(0),
+        idle_since: Cell::new(Some(Instant::now())),
         dead: Cell::new(false),
     });
 
@@ -773,6 +806,7 @@ pub(crate) fn create_client_session(
         streams: streams.clone(),
         next_stream_id: Cell::new(1), // client uses odd IDs
         active_count: Cell::new(0),
+        idle_since: Cell::new(Some(Instant::now())),
         dead: Cell::new(false),
     });
 

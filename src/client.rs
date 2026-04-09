@@ -1,9 +1,9 @@
-use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::bail;
-use monoio::io::{AsyncReadRent, AsyncReadRentExt, AsyncWriteRent, AsyncWriteRentExt, Splitable};
+use monoio::io::{AsyncReadRent, AsyncWriteRent, AsyncWriteRentExt, Splitable};
 use monoio::net::{TcpConnectOpts, TcpStream};
 use rand::seq::SliceRandom;
 use serde::{de::Visitor, Deserialize};
@@ -245,40 +245,96 @@ impl ShadowTlsClient {
         Ok(())
     }
 
+    /// Obtain a mux session: reuse existing or create new with serialization.
+    /// Only one task creates a session at a time; others poll and wait.
+    async fn get_or_create_mux_session(
+        &self,
+        pool: &mux::MuxPool,
+    ) -> anyhow::Result<Rc<mux::MuxSession>> {
+        const WAIT_TIMEOUT: Duration = Duration::from_secs(15);
+        const POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+        let deadline = Instant::now() + WAIT_TIMEOUT;
+
+        loop {
+            pool.cleanup();
+
+            if let Some(s) = pool.get_session() {
+                return Ok(s);
+            }
+
+            if Instant::now() >= deadline {
+                anyhow::bail!("mux: timed out waiting for session");
+            }
+
+            if !pool.try_lock_create() {
+                monoio::time::sleep(POLL_INTERVAL).await;
+                continue;
+            }
+
+            // Double-check after acquiring lock
+            if let Some(s) = pool.get_session() {
+                pool.unlock_create();
+                return Ok(s);
+            }
+
+            let result = self.create_mux_session(pool).await;
+            pool.unlock_create();
+            match result {
+                Ok(s) => return Ok(s),
+                Err(e) => {
+                    tracing::warn!("Mux: session creation failed: {e:#}");
+                    // Propagate non-transient errors immediately instead of
+                    // retrying until the deadline.
+                    let msg = format!("{e:#}");
+                    if msg.contains("TLS 1.3 is not supported") {
+                        return Err(e);
+                    }
+                    monoio::time::sleep(Duration::from_millis(500)).await;
+                }
+            }
+        }
+    }
+
+    /// Create a single mux session (TLS handshake + session setup).
+    async fn create_mux_session(
+        &self,
+        pool: &mux::MuxPool,
+    ) -> anyhow::Result<Rc<mux::MuxSession>> {
+        let addr = resolve(&self.target_addr).await?;
+        let mut stream = TcpStream::connect_addr_with_config(
+            addr,
+            &TcpConnectOpts::default().tcp_fast_open(self.fastopen),
+        )
+        .await?;
+        mod_tcp_conn(&mut stream, true, self.nodelay);
+
+        let sni = self.tls_names.random_choose();
+        let (server_random, tls13) = boring_tls::perform_v3_handshake(
+            &mut stream,
+            &self.ssl_connector,
+            sni,
+            &self.password,
+        )
+        .await?;
+
+        if !tls13 {
+            boring_tls::fake_request_and_drain(&mut stream, sni).await?;
+            anyhow::bail!("TLS 1.3 is not supported (mux requires TLS 1.3)");
+        }
+
+        tracing::info!("Mux: new TLS session established");
+        let aead_c2s = FrameAead::new(&self.password, &server_random, b"c2s");
+        let aead_s2c = FrameAead::new(&self.password, &server_random, b"s2c");
+        let s = mux::create_client_session(stream, aead_c2s, aead_s2c);
+        pool.add_session(s.clone());
+        Ok(s)
+    }
+
     /// Mux relay: reuse an existing TLS connection or create a new one.
     /// Multiple client connections share a single TLS session via stream multiplexing.
     async fn relay_mux(&self, in_stream: TcpStream, pool: &mux::MuxPool) -> anyhow::Result<()> {
-        // Try to reuse an existing session with capacity
-        let session = if let Some(s) = pool.get_session() {
-            s
-        } else {
-            // No available session — establish a new TLS connection
-            let addr = resolve(&self.target_addr).await?;
-            let mut stream = TcpStream::connect_addr_with_config(
-                addr,
-                &TcpConnectOpts::default().tcp_fast_open(self.fastopen),
-            )
-            .await?;
-            mod_tcp_conn(&mut stream, true, self.nodelay);
-
-            let sni = self.tls_names.random_choose();
-            let (server_random, tls13) =
-                boring_tls::perform_v3_handshake(&mut stream, &self.ssl_connector, sni, &self.password)
-                    .await?;
-
-            if !tls13 {
-                boring_tls::fake_request_and_drain(&mut stream, sni).await?;
-                bail!("TLS 1.3 is not supported (mux requires TLS 1.3)");
-            }
-
-            tracing::debug!("Mux: new TLS session established");
-            let aead_c2s = FrameAead::new(&self.password, &server_random, b"c2s");
-            let aead_s2c = FrameAead::new(&self.password, &server_random, b"s2c");
-
-            let s = mux::create_client_session(stream, aead_c2s, aead_s2c);
-            pool.add_session(s.clone());
-            s
-        };
+        let session = self.get_or_create_mux_session(pool).await?;
 
         // Open a new stream on the mux session
         let (stream_id, mut data_rx) = session.open_stream();

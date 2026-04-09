@@ -1,4 +1,3 @@
-
 use std::{collections::HashMap, path::PathBuf, process::exit};
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -58,7 +57,10 @@ struct Opts {
     #[clap(long, help = "Strict mode(only for v3 protocol)")]
     strict: bool,
     #[serde(default = "default_false")]
-    #[clap(long, help = "Enable connection multiplexing(multiple streams over one TLS connection)")]
+    #[clap(
+        long,
+        help = "Enable connection multiplexing(multiple streams over one TLS connection)"
+    )]
     mux: bool,
 }
 
@@ -352,6 +354,32 @@ pub(crate) fn get_sip003_arg() -> Option<Args> {
     Some(args)
 }
 
+/// Raise the NOFILE soft limit to the hard limit (or 65536, whichever is lower).
+/// Prevents "Too many open files" under high-concurrency proxy traffic.
+#[cfg(unix)]
+fn raise_fd_limit() {
+    unsafe {
+        let mut rlim = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+        if libc::getrlimit(libc::RLIMIT_NOFILE, rlim.as_mut_ptr()) != 0 {
+            return;
+        }
+        let mut rlim = rlim.assume_init();
+        let old_soft = rlim.rlim_cur;
+        let target = rlim.rlim_max.min(65536);
+        if old_soft >= target {
+            tracing::info!("NOFILE limit: {old_soft} (sufficient)");
+            return;
+        }
+        rlim.rlim_cur = target;
+        if libc::setrlimit(libc::RLIMIT_NOFILE, &rlim) == 0 {
+            tracing::info!("Raised NOFILE limit: {old_soft} → {target}");
+        } else {
+            let err = std::io::Error::last_os_error();
+            tracing::warn!("Failed to raise NOFILE limit from {old_soft} to {target}: {err}");
+        }
+    }
+}
+
 fn main() {
     tracing_subscriber::registry()
         .with(fmt::layer())
@@ -361,6 +389,8 @@ fn main() {
                 .from_env_lossy(),
         )
         .init();
+    #[cfg(unix)]
+    raise_fd_limit();
     let mut args = get_sip003_arg().unwrap_or_else(Args::parse);
     if let Commands::Config { config } = args.cmd {
         args = read_config_file(config.to_str().unwrap().to_string());

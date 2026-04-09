@@ -12,6 +12,7 @@ version = "0.2.25"
 [dependencies]
 monoio = { version = "0.2.0", features = ["sync"] }
 boring = "5"
+libc = "0.2"
 
 aes-gcm = "0.10"
 anyhow = "1"

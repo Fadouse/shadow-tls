@@ -15,8 +15,12 @@ use utils::{CAPTIVE_HTTP_REQUEST, CAPTIVE_HTTP_RESP};
 /// Build a simple boring TLS connector for testing.
 fn build_test_connector() -> SslConnector {
     let mut builder = SslConnector::builder(SslMethod::tls()).unwrap();
-    builder.set_min_proto_version(Some(SslVersion::TLS1_2)).unwrap();
-    builder.set_max_proto_version(Some(SslVersion::TLS1_3)).unwrap();
+    builder
+        .set_min_proto_version(Some(SslVersion::TLS1_2))
+        .unwrap();
+    builder
+        .set_max_proto_version(Some(SslVersion::TLS1_3))
+        .unwrap();
     builder.set_alpn_protos(b"\x02h2\x08http/1.1").unwrap();
     builder.build()
 }
@@ -54,7 +58,10 @@ impl SyncBridge {
 impl Read for SyncBridge {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if self.read_buf.is_empty() {
-            return Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "need more data"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "need more data",
+            ));
         }
         let (front, _) = self.read_buf.as_slices();
         let n = buf.len().min(front.len());
@@ -87,6 +94,7 @@ async fn sni() {
         nodelay: true,
         fastopen: true,
         v3: V3Mode::Strict,
+        mux: false,
     };
     server.build().expect("build server failed").start(1);
     monoio::time::sleep(Duration::from_secs(1)).await;
@@ -96,7 +104,11 @@ async fn sni() {
 
     // Perform TLS handshake via SyncBridge
     let bridge = SyncBridge::new();
-    let ssl = connector.configure().unwrap().into_ssl("captive.apple.com").unwrap();
+    let ssl = connector
+        .configure()
+        .unwrap()
+        .into_ssl("captive.apple.com")
+        .unwrap();
     let mut builder = boring::ssl::SslStreamBuilder::new(ssl, bridge);
     builder.set_connect_state();
 

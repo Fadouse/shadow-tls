@@ -9,11 +9,16 @@ use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use local_sync::oneshot::{Receiver, Sender};
 use monoio::{
     buf::IoBufMut,
-    io::{AsyncReadRent, AsyncWriteRent, AsyncWriteRentExt, Splitable},
+    io::{
+        AsyncReadRent, AsyncWriteRent, AsyncWriteRentExt, CancelableAsyncReadRent, Canceller,
+        Splitable,
+    },
     net::{ListenerOpts, TcpListener, TcpStream},
 };
 
-use aes_gcm::{aead::AeadInPlace, aead::generic_array::typenum::U12, Aes128Gcm, KeyInit as AesKeyInit, Nonce};
+use aes_gcm::{
+    aead::generic_array::typenum::U12, aead::AeadInPlace, Aes128Gcm, KeyInit as AesKeyInit, Nonce,
+};
 use hkdf::Hkdf;
 use hmac::Mac;
 use rand::Rng;
@@ -186,11 +191,14 @@ impl Hmac {
         let hash = hmac.finalize().into_bytes();
         let mut res = [0; SESSION_HMAC_SIZE];
         unsafe {
-            copy_nonoverlapping(hash.as_slice().as_ptr(), res.as_mut_ptr(), SESSION_HMAC_SIZE)
+            copy_nonoverlapping(
+                hash.as_slice().as_ptr(),
+                res.as_mut_ptr(),
+                SESSION_HMAC_SIZE,
+            )
         };
         res
     }
-
 }
 
 /// Per-frame AEAD with AES-128-GCM, independent sequence numbers, and direction-separated keys.
@@ -246,7 +254,7 @@ impl FrameAead {
     fn make_nonce(&self) -> Nonce<U12> {
         let mut nonce = self.base_nonce;
         let seq_bytes = self.seq.to_be_bytes(); // 8 bytes
-        // XOR seq into the last 8 bytes of the nonce
+                                                // XOR seq into the last 8 bytes of the nonce
         nonce[4] ^= seq_bytes[0];
         nonce[5] ^= seq_bytes[1];
         nonce[6] ^= seq_bytes[2];
@@ -333,7 +341,8 @@ impl PaddingState {
         // roughly bell-shaped distribution centered around 9, range [5, 13].
         // This eliminates the fixed-boundary fingerprint that an observer
         // could detect across multiple connections.
-        let transition_point = 5 + rng.gen_range(0..=3u32) as usize
+        let transition_point = 5
+            + rng.gen_range(0..=3u32) as usize
             + rng.gen_range(0..=3u32) as usize
             + rng.gen_range(0..=2u32) as usize;
         Self {
@@ -449,7 +458,16 @@ pub(crate) async fn verified_relay(
     alert_enabled: bool,
     auth_pending: bool,
 ) {
-    verified_relay_with_coalesce(raw, tls, aead_encrypt, aead_decrypt, alert_enabled, auth_pending, 0).await;
+    verified_relay_with_coalesce(
+        raw,
+        tls,
+        aead_encrypt,
+        aead_decrypt,
+        alert_enabled,
+        auth_pending,
+        0,
+    )
+    .await;
 }
 
 pub(crate) async fn verified_relay_with_coalesce(
@@ -461,7 +479,9 @@ pub(crate) async fn verified_relay_with_coalesce(
     auth_pending: bool,
     coalesce_ms: u64,
 ) {
-    tracing::debug!("verified relay started (auth_pending={auth_pending}, coalesce_ms={coalesce_ms})");
+    tracing::debug!(
+        "verified relay started (auth_pending={auth_pending}, coalesce_ms={coalesce_ms})"
+    );
     let (mut tls_read, mut tls_write) = tls.into_split();
     let (mut raw_read, mut raw_write) = raw.into_split();
     let (mut notfied, mut notifier) = local_sync::oneshot::channel::<()>();
@@ -654,8 +674,7 @@ async fn copy_remove_appdata_and_decrypt(
                     return;
                 }
 
-                let header: [u8; TLS_HEADER_SIZE] =
-                    frame[..TLS_HEADER_SIZE].try_into().unwrap();
+                let header: [u8; TLS_HEADER_SIZE] = frame[..TLS_HEADER_SIZE].try_into().unwrap();
                 let mut tag = [0u8; HMAC_SIZE];
                 tag.copy_from_slice(&frame[TLS_HEADER_SIZE..TLS_HMAC_HEADER_SIZE]);
 
@@ -727,10 +746,7 @@ async fn copy_remove_appdata_and_decrypt(
                         alert_notifier.close();
                         return;
                     }
-                    tracing::debug!(
-                        "auth pending: discarding frame type=0x{:02x}",
-                        frame[0]
-                    );
+                    tracing::debug!("auth pending: discarding frame type=0x{:02x}", frame[0]);
                     continue;
                 }
                 alert_notifier.close();
@@ -756,7 +772,7 @@ const ENCRYPT_BUF_SIZE: usize = 16384 + FRAME_OVERHEAD + 16384;
 const MAX_DATA_PER_FRAME: usize = 16384 - HMAC_SIZE - INNER_HEADER_SIZE;
 
 async fn copy_add_appdata_and_encrypt(
-    mut read: impl AsyncReadRent,
+    mut read: impl CancelableAsyncReadRent,
     mut write: impl AsyncWriteRent,
     aead: &mut FrameAead,
     alert_notified: &mut Sender<()>,
@@ -771,13 +787,31 @@ async fn copy_add_appdata_and_encrypt(
 
     let mut padding = PaddingState::new();
 
-    // io_uring safety: never race a read against alert_notified in select!.
-    // Dropping an in-flight io_uring read leaks the buffer. Instead, complete
-    // the read first and check the alert flag after each iteration.
     loop {
-        let (res, buf) = read.read(buffer.slice_mut(FRAME_OVERHEAD..FRAME_OVERHEAD + MAX_DATA_PER_FRAME)).await;
+        if alert_notified.is_closed() {
+            send_alert(&mut write, alert_enabled).await;
+            return;
+        }
+
+        // Use monoio's explicit cancellation support so the alert path can
+        // interrupt an in-flight read without dropping the submitted op.
+        let canceller = Canceller::new();
+        let mut read_fut = std::pin::pin!(read.cancelable_read(
+            buffer.slice_mut(FRAME_OVERHEAD..FRAME_OVERHEAD + MAX_DATA_PER_FRAME),
+            canceller.handle(),
+        ));
+
+        let (res, buf) = monoio::select! {
+            biased;
+            _ = alert_notified.closed() => {
+                let _ = canceller.cancel();
+                read_fut.await
+            }
+            read_res = &mut read_fut => read_res,
+        };
+
         if matches!(res, Ok(0) | Err(_)) || alert_notified.is_closed() {
-            buffer = buf.into_inner();
+            let _ = buf.into_inner();
             send_alert(&mut write, alert_enabled).await;
             return;
         }
@@ -807,12 +841,8 @@ async fn copy_add_appdata_and_encrypt(
             .unwrap();
 
         // AES-128-GCM encrypt inner payload in-place, get 16-byte tag
-        let header: [u8; TLS_HEADER_SIZE] =
-            buffer[..TLS_HEADER_SIZE].try_into().unwrap();
-        let tag = aead.encrypt_and_advance(
-            &header,
-            &mut buffer[TLS_HMAC_HEADER_SIZE..],
-        );
+        let header: [u8; TLS_HEADER_SIZE] = buffer[..TLS_HEADER_SIZE].try_into().unwrap();
+        let tag = aead.encrypt_and_advance(&header, &mut buffer[TLS_HMAC_HEADER_SIZE..]);
         unsafe {
             copy_nonoverlapping(
                 tag.as_ptr(),
@@ -833,7 +863,6 @@ async fn copy_add_appdata_and_encrypt(
     }
 }
 
-
 /// Coalescing version: adds a brief delay before reading to let the kernel's
 /// TCP receive buffer accumulate data, producing fewer, larger TLS records.
 ///
@@ -845,7 +874,7 @@ async fn copy_add_appdata_and_encrypt(
 /// Net effect: interactive protocols (SSH, HTTP/2 control frames) produce
 /// ~2-5x fewer TLS records, matching real HTTPS coalescing behavior.
 async fn copy_add_appdata_coalesced(
-    mut read: impl AsyncReadRent,
+    mut read: impl CancelableAsyncReadRent,
     mut write: impl AsyncWriteRent,
     aead: &mut FrameAead,
     alert_notified: &mut Sender<()>,
@@ -862,17 +891,34 @@ async fn copy_add_appdata_coalesced(
     let coalesce_dur = Duration::from_millis(coalesce_ms);
     let mut packet_count: usize = 0;
 
-    // io_uring safety: complete the read before checking alert, same as
-    // copy_add_appdata_and_encrypt. Coalescing delay is applied BEFORE the
-    // read so it naturally batches TCP data without cancelling in-flight ops.
     loop {
+        if alert_notified.is_closed() {
+            send_alert(&mut write, alert_enabled).await;
+            return;
+        }
+
+        // Coalescing: sleep before read to let kernel batch TCP data
         if packet_count > 0 {
             monoio::time::sleep(coalesce_dur).await;
         }
 
-        let (res, buf) = read.read(buffer.slice_mut(FRAME_OVERHEAD..FRAME_OVERHEAD + MAX_DATA_PER_FRAME)).await;
+        let canceller = Canceller::new();
+        let mut read_fut = std::pin::pin!(read.cancelable_read(
+            buffer.slice_mut(FRAME_OVERHEAD..FRAME_OVERHEAD + MAX_DATA_PER_FRAME),
+            canceller.handle(),
+        ));
+
+        let (res, buf) = monoio::select! {
+            biased;
+            _ = alert_notified.closed() => {
+                let _ = canceller.cancel();
+                read_fut.await
+            }
+            read_res = &mut read_fut => read_res,
+        };
+
         if matches!(res, Ok(0) | Err(_)) || alert_notified.is_closed() {
-            buffer = buf.into_inner();
+            let _ = buf.into_inner();
             send_alert(&mut write, alert_enabled).await;
             return;
         }
@@ -903,12 +949,8 @@ async fn copy_add_appdata_coalesced(
             .unwrap();
 
         // Encrypt
-        let header: [u8; TLS_HEADER_SIZE] =
-            buffer[..TLS_HEADER_SIZE].try_into().unwrap();
-        let tag = aead.encrypt_and_advance(
-            &header,
-            &mut buffer[TLS_HMAC_HEADER_SIZE..],
-        );
+        let header: [u8; TLS_HEADER_SIZE] = buffer[..TLS_HEADER_SIZE].try_into().unwrap();
+        let tag = aead.encrypt_and_advance(&header, &mut buffer[TLS_HMAC_HEADER_SIZE..]);
         unsafe {
             copy_nonoverlapping(
                 tag.as_ptr(),

@@ -1015,6 +1015,7 @@ dependencies = [
  "ctrlc",
  "hkdf",
  "hmac",
+ "libc",
  "local-sync",
  "monoio",
  "pin-project-lite",

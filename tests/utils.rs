@@ -89,7 +89,7 @@ pub fn test_hijack(client: RunningArgs) {
     // — no valid data should be received.
     let mut dummy_buf = [0; 256];
     match conn.read(&mut dummy_buf) {
-        Ok(0) => {} // connection closed — correct
+        Ok(0) => {}  // connection closed — correct
         Err(_) => {} // timeout or reset — correct
         Ok(n) => {
             // If we received data, it means unauthorized bytes got through.

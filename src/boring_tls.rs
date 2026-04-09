@@ -55,10 +55,8 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// TLS 1.3 HelloRetryRequest uses this fixed synthetic ServerRandom (RFC 8446 §4.1.3).
 pub(crate) const HRR_RANDOM: [u8; 32] = [
-    0xCF, 0x21, 0xAD, 0x74, 0xE5, 0x9A, 0x61, 0x11,
-    0xBE, 0x1D, 0x8C, 0x02, 0x1E, 0x65, 0xB8, 0x91,
-    0xC2, 0xA2, 0x11, 0x16, 0x7A, 0xBB, 0x8C, 0x5E,
-    0x07, 0x9E, 0x09, 0xE2, 0xC8, 0xA8, 0x33, 0x9C,
+    0xCF, 0x21, 0xAD, 0x74, 0xE5, 0x9A, 0x61, 0x11, 0xBE, 0x1D, 0x8C, 0x02, 0x1E, 0x65, 0xB8, 0x91,
+    0xC2, 0xA2, 0x11, 0x16, 0x7A, 0xBB, 0x8C, 0x5E, 0x07, 0x9E, 0x09, 0xE2, 0xC8, 0xA8, 0x33, 0x9C,
 ];
 
 // ---------------------------------------------------------------------------
@@ -414,7 +412,10 @@ fn append_random_finished(data: &mut Vec<u8>, cipher: Tls13Cipher) {
     data[start + 2] = TLS_MINOR.0;
     data[start + 3] = (payload_len >> 8) as u8;
     data[start + 4] = payload_len as u8;
-    rand::Rng::fill(&mut rand::thread_rng(), &mut data[start + TLS_HEADER_SIZE..]);
+    rand::Rng::fill(
+        &mut rand::thread_rng(),
+        &mut data[start + TLS_HEADER_SIZE..],
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -448,9 +449,8 @@ pub(crate) async fn perform_v3_handshake(
     let (mut mid, mut client_hello) = start_handshake(connector, sni)?;
 
     // Phase 2: Save original session_id, then patch with HMAC
-    let original_sid = save_session_id(&client_hello).ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidData, "cannot extract session_id")
-    })?;
+    let original_sid = save_session_id(&client_hello)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "cannot extract session_id"))?;
     if !patch_session_id(&mut client_hello, password) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -631,7 +631,10 @@ pub(crate) async fn perform_v3_handshake(
                 ));
             }
             Err(HandshakeError::SetupFailure(e)) => {
-                return Err(io::Error::new(io::ErrorKind::Other, format!("TLS setup failure: {e}")));
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("TLS setup failure: {e}"),
+                ));
             }
         }
     }
@@ -678,11 +681,10 @@ pub(crate) async fn fake_request_and_drain(tcp: &mut TcpStream, sni: &str) -> io
     // Send a fake encrypted HTTP request as ApplicationData.
     // Size matches a realistic GET request for the configured SNI host.
     // Content is random (encrypted traffic is indistinguishable from random).
-    let fake_len = format!(
-        "GET / HTTP/1.1\r\nHost: {sni}\r\nUser-Agent: Mozilla/5.0\r\nAccept: */*\r\n\r\n"
-    )
-    .len()
-        + (rand::random::<usize>() % 32);
+    let fake_len =
+        format!("GET / HTTP/1.1\r\nHost: {sni}\r\nUser-Agent: Mozilla/5.0\r\nAccept: */*\r\n\r\n")
+            .len()
+            + (rand::random::<usize>() % 32);
     let mut frame = vec![0u8; TLS_HEADER_SIZE + fake_len];
     frame[0] = APPLICATION_DATA;
     frame[1] = TLS_MAJOR;

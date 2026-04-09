@@ -18,6 +18,7 @@ fn tls13_v3_lossy() {
         nodelay: true,
         fastopen: true,
         v3: V3Mode::Lossy,
+        mux: false,
     };
     let server = RunningArgs::Server {
         listen_addr: "127.0.0.1:31003".to_string(),
@@ -27,6 +28,7 @@ fn tls13_v3_lossy() {
         nodelay: true,
         fastopen: true,
         v3: V3Mode::Lossy,
+        mux: false,
     };
     utils::test_ok(client, server, BING_HTTP_REQUEST, BING_HTTP_RESP);
 }
@@ -45,6 +47,7 @@ fn tls13_v3_strict() {
         nodelay: true,
         fastopen: true,
         v3: V3Mode::Strict,
+        mux: false,
     };
     let server = RunningArgs::Server {
         listen_addr: "127.0.0.1:31005".to_string(),
@@ -54,6 +57,7 @@ fn tls13_v3_strict() {
         nodelay: true,
         fastopen: true,
         v3: V3Mode::Strict,
+        mux: false,
     };
     utils::test_ok(client, server, BING_HTTP_REQUEST, BING_HTTP_RESP);
 }
@@ -72,6 +76,7 @@ fn tls13_v3_lossy_hijack() {
         nodelay: true,
         fastopen: true,
         v3: V3Mode::Lossy,
+        mux: false,
     };
     test_hijack(client);
 }
@@ -90,6 +95,7 @@ fn tls13_v3_strict_hijack() {
         nodelay: true,
         fastopen: true,
         v3: V3Mode::Strict,
+        mux: false,
     };
     test_hijack(client);
 }

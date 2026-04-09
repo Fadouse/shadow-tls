@@ -21,6 +21,7 @@ fn tls12_v3_lossy() {
         nodelay: true,
         fastopen: true,
         v3: V3Mode::Lossy,
+        mux: false,
     };
     let server = RunningArgs::Server {
         listen_addr: "127.0.0.1:30003".to_string(),
@@ -30,6 +31,7 @@ fn tls12_v3_lossy() {
         nodelay: true,
         fastopen: true,
         v3: V3Mode::Lossy,
+        mux: false,
     };
     // Lossy mode: try to relay, but connection may fail if TLS 1.2 only.
     // Success means TLS 1.3 was negotiated; failure is acceptable for TLS 1.2.
@@ -51,6 +53,7 @@ fn tls12_v3_strict() {
         nodelay: true,
         fastopen: true,
         v3: V3Mode::Strict,
+        mux: false,
     };
     let server = RunningArgs::Server {
         listen_addr: "127.0.0.1:30005".to_string(),
@@ -60,6 +63,7 @@ fn tls12_v3_strict() {
         nodelay: true,
         fastopen: true,
         v3: V3Mode::Strict,
+        mux: false,
     };
     test_strict_rejects(client, server);
 }
@@ -78,6 +82,7 @@ fn tls12_v3_lossy_hijack() {
         nodelay: true,
         fastopen: true,
         v3: V3Mode::Lossy,
+        mux: false,
     };
     test_hijack(client);
 }
@@ -97,6 +102,7 @@ fn tls12_v2_hijack() {
         nodelay: true,
         fastopen: true,
         v3: V3Mode::Strict,
+        mux: false,
     };
     test_hijack(client);
 }
