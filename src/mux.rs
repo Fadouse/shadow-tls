@@ -25,7 +25,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use byteorder::{BigEndian, WriteBytesExt};
-use monoio::io::{AsyncReadRent, AsyncReadRentExt, AsyncWriteRent, AsyncWriteRentExt, Splitable};
+use monoio::io::{AsyncReadRent, AsyncWriteRent, AsyncWriteRentExt, Splitable};
 use monoio::net::TcpStream;
 
 use crate::util::prelude::*;
@@ -44,8 +44,6 @@ pub(crate) const MAX_MUX_DATA: usize = MAX_INNER_PAYLOAD - 7;
 const DEFAULT_MAX_STREAMS: usize = 128;
 /// Idle timeout for a mux session with no active streams.
 const MUX_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
-/// Max buffered outbound bytes before backpressure.
-const WRITE_CHANNEL_CAP: usize = 256;
 
 // ---------------------------------------------------------------------------
 // MuxFrame — parsed representation of a mux command
@@ -365,9 +363,16 @@ impl MuxPool {
         self.creating.set(false);
     }
 
-    /// Register a new session.
+    /// Register a new session. Drops the oldest idle session if at capacity.
     pub(crate) fn add_session(&self, session: Rc<MuxSession>) {
-        self.sessions.borrow_mut().push(session);
+        let mut sessions = self.sessions.borrow_mut();
+        if sessions.len() >= self.max_sessions {
+            // Evict the first idle (or dead) session to make room
+            if let Some(idx) = sessions.iter().position(|s| !s.is_alive() || s.active_count.get() == 0) {
+                sessions.swap_remove(idx);
+            }
+        }
+        sessions.push(session);
     }
 
     /// Remove dead sessions and sessions idle longer than MUX_IDLE_TIMEOUT.
@@ -403,70 +408,57 @@ pub(crate) async fn mux_write_loop(
     mut aead: FrameAead,
     session: Rc<MuxSession>,
 ) {
-    use std::ptr::copy_nonoverlapping;
-
+    // Single buffer: [TLS_HDR:5][TAG:16][mux_frames...][padding...]
+    // Frames are encoded directly here — no intermediate Vec allocation.
     let mut buffer = Vec::with_capacity(32768);
     let mut padding = PaddingState::new();
 
-    let result: () = async {
+    let _: () = async {
     loop {
-        // Wait for at least one frame
         let first = match rx.recv().await {
             Some(f) => f,
-            None => return, // Channel closed — session dead
+            None => return,
         };
 
-        // Build inner payload: serialize first frame + drain channel for more
-        let mut inner = Vec::with_capacity(4096);
-        first.encode(&mut inner);
-
-        // Drain any immediately available frames (coalescing)
-        while inner.len() < MAX_INNER_PAYLOAD - 64 {
-            match rx.try_recv() {
-                Ok(f) => f.encode(&mut inner),
-                Err(_) => break,
-            }
-        }
-
-        // Build the TLS record
+        // Build TLS record header + tag placeholder
         buffer.clear();
-        buffer.resize(TLS_HEADER_SIZE, 0);
+        buffer.resize(TLS_HMAC_HEADER_SIZE, 0);
         buffer[0] = APPLICATION_DATA;
         buffer[1] = TLS_MAJOR;
         buffer[2] = TLS_MINOR.0;
 
-        // [TAG:16] will be filled after encryption
-        buffer.resize(TLS_HMAC_HEADER_SIZE, 0);
+        // Encode first frame directly into buffer (zero-copy: no intermediate Vec)
+        first.encode(&mut buffer);
 
-        // Append the inner payload (will be encrypted)
-        buffer.extend_from_slice(&inner);
-
-        // Add padding (clamped so TLS record payload stays ≤ 16384)
-        let current_payload = HMAC_SIZE + inner.len();
-        let mut pad_len = padding.next_padding_len(current_payload);
-        let max_pad = MAX_INNER_PAYLOAD.saturating_sub(inner.len());
-        pad_len = pad_len.min(max_pad);
-        if pad_len > 0 {
-            buffer.resize(buffer.len() + pad_len, 0);
-            rand::Rng::fill(&mut rand::thread_rng(), &mut buffer[TLS_HMAC_HEADER_SIZE + inner.len()..]);
+        // Coalesce: drain channel for more frames
+        while buffer.len() - TLS_HMAC_HEADER_SIZE < MAX_INNER_PAYLOAD - 64 {
+            match rx.try_recv() {
+                Ok(f) => f.encode(&mut buffer),
+                Err(_) => break,
+            }
         }
 
-        // Write TLS record length
+        let inner_len = buffer.len() - TLS_HMAC_HEADER_SIZE;
+
+        // Padding (clamped to TLS record limit)
+        let current_payload = HMAC_SIZE + inner_len;
+        let mut pad_len = padding.next_padding_len(current_payload);
+        pad_len = pad_len.min(MAX_INNER_PAYLOAD.saturating_sub(inner_len));
+        if pad_len > 0 {
+            buffer.resize(buffer.len() + pad_len, 0);
+            rand::Rng::fill(&mut rand::thread_rng(), &mut buffer[TLS_HMAC_HEADER_SIZE + inner_len..]);
+        }
+
+        // TLS record length
         let frame_len = buffer.len() - TLS_HEADER_SIZE;
         (&mut buffer[3..5])
             .write_u16::<BigEndian>(frame_len as u16)
             .unwrap();
 
-        // Encrypt
+        // Encrypt in-place, write tag
         let header: [u8; TLS_HEADER_SIZE] = buffer[..TLS_HEADER_SIZE].try_into().unwrap();
         let tag = aead.encrypt_and_advance(&header, &mut buffer[TLS_HMAC_HEADER_SIZE..]);
-        unsafe {
-            copy_nonoverlapping(
-                tag.as_ptr(),
-                buffer.as_mut_ptr().add(TLS_HEADER_SIZE),
-                HMAC_SIZE,
-            )
-        };
+        buffer[TLS_HEADER_SIZE..TLS_HMAC_HEADER_SIZE].copy_from_slice(&tag);
 
         let (res, buf) = tls_write.write_all(buffer).await;
         buffer = buf;
@@ -475,8 +467,6 @@ pub(crate) async fn mux_write_loop(
         }
     }
     }.await;
-    // Write loop exiting — mark session dead and unblock all streams
-    let _ = result;
     session.shutdown();
 }
 
@@ -631,9 +621,11 @@ pub(crate) async fn mux_server_dispatch(
 
     let (tls_read, tls_write) = tls.into_split();
 
+    // Pre-resolve data server address once (avoids per-stream DNS lookup).
+    let data_addr = resolve(target_addr).await?;
+
     // Handle the first SYN
     if let MuxFrame::Syn { stream_id, .. } = first_syn {
-        let data_addr = resolve(target_addr).await?;
         spawn_server_stream(
             session.clone(),
             stream_id,
@@ -644,11 +636,8 @@ pub(crate) async fn mux_server_dispatch(
 
     // Spawn the write loop
     let session_for_read = session.clone();
-    let target_addr = target_addr.to_string();
-
-    // Override the read loop to also handle SYN by spawning new data connections
     let nodelay_val = nodelay;
-    let read_handle = monoio::spawn(async move {
+    let _read_handle = monoio::spawn(async move {
         use crate::util::BufferFrameDecoder;
         const INIT_BUFFER_SIZE: usize = 4096;
 
@@ -659,11 +648,11 @@ pub(crate) async fn mux_server_dispatch(
         loop {
             let maybe_frame = match decoder.next().await {
                 Ok(f) => f,
-                Err(_) => return,
+                Err(_) => break,
             };
             let frame = match maybe_frame {
                 Some(f) => f,
-                None => return,
+                None => break,
             };
 
             if frame[0] != APPLICATION_DATA || frame.len() < TLS_HMAC_HEADER_SIZE {
@@ -679,7 +668,7 @@ pub(crate) async fn mux_server_dispatch(
 
             if !aead.decrypt_and_advance(&header, &mut decrypt_buf, &tag) {
                 tracing::warn!("mux server: AEAD verification failed");
-                return;
+                break;
             }
 
             let mut pos = 0;
@@ -689,15 +678,12 @@ pub(crate) async fn mux_server_dispatch(
                         pos += consumed;
                         match &mux_frame {
                             MuxFrame::Syn { stream_id, .. } => {
-                                // New stream: connect to data server
-                                if let Ok(addr) = resolve(&target_addr).await {
-                                    spawn_server_stream(
-                                        session_for_read.clone(),
-                                        *stream_id,
-                                        addr,
-                                        nodelay_val,
-                                    );
-                                }
+                                spawn_server_stream(
+                                    session_for_read.clone(),
+                                    *stream_id,
+                                    data_addr,
+                                    nodelay_val,
+                                );
                             }
                             _ => {
                                 session_for_read.dispatch_inbound(mux_frame);
@@ -708,6 +694,9 @@ pub(crate) async fn mux_server_dispatch(
                 }
             }
         }
+        // Read loop exiting — shutdown session to unblock all waiting streams.
+        // Without this, streams hang forever on data_rx.recv() when TLS drops.
+        session_for_read.shutdown();
     });
 
     // Run the write loop in the current task

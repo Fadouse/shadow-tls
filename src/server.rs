@@ -1,6 +1,5 @@
 use std::{
     borrow::Cow,
-    ptr::copy_nonoverlapping,
     rc::Rc,
     sync::Arc,
 };
@@ -504,14 +503,7 @@ fn extract_server_random(frame: &[u8]) -> Option<[u8; TLS_RANDOM_SIZE]> {
     }
 
     let mut server_random = [0; TLS_RANDOM_SIZE];
-    unsafe {
-        copy_nonoverlapping(
-            frame.as_ptr().add(SERVER_RANDOM_IDX),
-            server_random.as_mut_ptr(),
-            TLS_RANDOM_SIZE,
-        )
-    };
-
+    server_random.copy_from_slice(&frame[SERVER_RANDOM_IDX..SERVER_RANDOM_IDX + TLS_RANDOM_SIZE]);
     Some(server_random)
 }
 

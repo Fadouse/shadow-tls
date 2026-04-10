@@ -1,7 +1,6 @@
 use std::{
     io::{ErrorKind, Read},
     net::ToSocketAddrs,
-    ptr::copy_nonoverlapping,
     time::Duration,
 };
 
@@ -74,9 +73,6 @@ pub(crate) mod prelude {
 
     /// Max inner payload per TLS record (data portion, excluding TLS header and GCM tag).
     pub(crate) const MAX_INNER_PAYLOAD: usize = 16384 - HMAC_SIZE;
-
-    /// Default coalescing timeout in milliseconds (0 = disabled).
-    pub(crate) const DEFAULT_COALESCE_MS: u64 = 2;
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -190,13 +186,7 @@ impl Hmac {
         let hmac = self.0.clone();
         let hash = hmac.finalize().into_bytes();
         let mut res = [0; SESSION_HMAC_SIZE];
-        unsafe {
-            copy_nonoverlapping(
-                hash.as_slice().as_ptr(),
-                res.as_mut_ptr(),
-                SESSION_HMAC_SIZE,
-            )
-        };
+        res.copy_from_slice(&hash.as_slice()[..SESSION_HMAC_SIZE]);
         res
     }
 }
@@ -410,44 +400,6 @@ pub(crate) fn parse_inner_frame(inner: &[u8]) -> Option<(u8, &[u8])> {
         return None;
     }
     Some((cmd, &inner[INNER_HEADER_SIZE..INNER_HEADER_SIZE + data_len]))
-}
-
-/// Iterator over multiple inner frames packed in a single decrypted payload.
-/// Supports coalesced records where multiple [CMD][LEN][data] tuples are
-/// concatenated before encryption. Trailing bytes (padding) are ignored.
-pub(crate) struct InnerFrameIter<'a> {
-    data: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> InnerFrameIter<'a> {
-    pub(crate) fn new(data: &'a [u8]) -> Self {
-        Self { data, pos: 0 }
-    }
-}
-
-impl<'a> Iterator for InnerFrameIter<'a> {
-    /// (cmd, data_offset_in_original_buffer, data_len)
-    type Item = (u8, usize, usize);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let remaining = &self.data[self.pos..];
-        if remaining.len() < INNER_HEADER_SIZE {
-            return None;
-        }
-        let cmd = remaining[0];
-        let data_len = u16::from_be_bytes([remaining[1], remaining[2]]) as usize;
-        if remaining.len() < INNER_HEADER_SIZE + data_len {
-            return None;
-        }
-        let data_offset = self.pos + INNER_HEADER_SIZE;
-        self.pos += INNER_HEADER_SIZE + data_len;
-        // For PADDING frames, consume the rest as padding (no more frames after)
-        if cmd == CMD_PADDING && data_len == 0 {
-            self.pos = self.data.len();
-        }
-        Some((cmd, data_offset, data_len))
-    }
 }
 
 pub(crate) async fn verified_relay(
@@ -843,13 +795,7 @@ async fn copy_add_appdata_and_encrypt(
         // AES-128-GCM encrypt inner payload in-place, get 16-byte tag
         let header: [u8; TLS_HEADER_SIZE] = buffer[..TLS_HEADER_SIZE].try_into().unwrap();
         let tag = aead.encrypt_and_advance(&header, &mut buffer[TLS_HMAC_HEADER_SIZE..]);
-        unsafe {
-            copy_nonoverlapping(
-                tag.as_ptr(),
-                buffer.as_mut_ptr().add(TLS_HEADER_SIZE),
-                HMAC_SIZE,
-            )
-        };
+        buffer[TLS_HEADER_SIZE..TLS_HMAC_HEADER_SIZE].copy_from_slice(&tag);
 
         let (res, buf) = write.write_all(buffer).await;
         buffer = buf;
@@ -951,17 +897,14 @@ async fn copy_add_appdata_coalesced(
         // Encrypt
         let header: [u8; TLS_HEADER_SIZE] = buffer[..TLS_HEADER_SIZE].try_into().unwrap();
         let tag = aead.encrypt_and_advance(&header, &mut buffer[TLS_HMAC_HEADER_SIZE..]);
-        unsafe {
-            copy_nonoverlapping(
-                tag.as_ptr(),
-                buffer.as_mut_ptr().add(TLS_HEADER_SIZE),
-                HMAC_SIZE,
-            )
-        };
+        buffer[TLS_HEADER_SIZE..TLS_HMAC_HEADER_SIZE].copy_from_slice(&tag);
 
         let (res, buf) = write.write_all(buffer).await;
         buffer = buf;
         unsafe { buffer.set_len(FRAME_OVERHEAD) };
+        if res.is_err() {
+            return;
+        }
     }
 }
 
@@ -979,7 +922,7 @@ async fn send_alert(mut w: impl AsyncWriteRent, alert_enabled: bool) {
     ];
 
     let mut buf = vec![0; FULL_SIZE as usize];
-    unsafe { copy_nonoverlapping(HEADER.as_ptr(), buf.as_mut_ptr(), HEADER.len()) };
+    buf[..HEADER.len()].copy_from_slice(&HEADER);
     rand::thread_rng().fill(&mut buf[HEADER.len()..]);
 
     let _ = w.write_all(buf).await;
