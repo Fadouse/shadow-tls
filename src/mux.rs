@@ -80,7 +80,7 @@ impl BufPool {
     /// Return a consumed buffer to the pool. Drops silently if pool is full.
     pub(crate) fn put(&self, buf: Vec<u8>) {
         let mut pool = self.pool.borrow_mut();
-        if pool.len() < 64 {
+        if pool.len() < 128 {
             pool.push(buf);
         }
     }
@@ -139,6 +139,24 @@ impl MuxFrame {
                 buf.extend_from_slice(&ping_id.to_be_bytes());
             }
         }
+    }
+
+    /// Like `decode`, but uses the BufPool for Data payload allocation,
+    /// reusing previously returned buffers instead of allocating new Vecs.
+    pub(crate) fn decode_pooled(data: &[u8], pool: &BufPool) -> Option<(MuxFrame, usize)> {
+        if data.is_empty() {
+            return None;
+        }
+        if data[0] == CMD_MUX_DATA {
+            if data.len() < 7 { return None; }
+            let sid = u32::from_be_bytes(data[1..5].try_into().unwrap());
+            let dlen = u16::from_be_bytes(data[5..7].try_into().unwrap()) as usize;
+            if data.len() < 7 + dlen { return None; }
+            let payload = pool.take(&data[7..7 + dlen]);
+            return Some((MuxFrame::Data { stream_id: sid, payload }, 7 + dlen));
+        }
+        // Non-Data frames: fall through to standard decode (no allocation)
+        Self::decode(data)
     }
 
     /// Parse one mux frame from a slice. Returns (frame, bytes_consumed) or None.
@@ -494,8 +512,9 @@ pub(crate) async fn mux_write_loop(
         let mut pad_len = padding.next_padding_len(current_payload);
         pad_len = pad_len.min(MAX_INNER_PAYLOAD.saturating_sub(inner_len));
         if pad_len > 0 {
+            // Padding is inside the AEAD envelope — ciphertext is
+            // indistinguishable from random regardless of plaintext.
             buffer.resize(buffer.len() + pad_len, 0);
-            rand::Rng::fill(&mut rand::thread_rng(), &mut buffer[TLS_HMAC_HEADER_SIZE + inner_len..]);
         }
 
         // TLS record length
@@ -535,8 +554,9 @@ pub(crate) async fn mux_read_loop(
     session: Rc<MuxSession>,
     mut aead: FrameAead,
     auth_pending: bool,
+    pool: Rc<BufPool>,
 ) {
-    mux_read_loop_inner(tls_read, &session, &mut aead, auth_pending).await;
+    mux_read_loop_inner(tls_read, &session, &mut aead, auth_pending, &pool).await;
     // Read loop exiting — mark session dead and unblock all streams
     session.shutdown();
 }
@@ -546,15 +566,16 @@ async fn mux_read_loop_inner(
     session: &MuxSession,
     aead: &mut FrameAead,
     auth_pending: bool,
+    pool: &BufPool,
 ) {
     use crate::util::BufferFrameDecoder;
-    const INIT_BUFFER_SIZE: usize = 4096;
+    /// Decoder buffer sized for a full TLS record to avoid early reallocation.
+    const INIT_BUFFER_SIZE: usize = TLS_HEADER_SIZE + 16384;
     /// Max bytes/time discarded during auth-pending phase.
     const AUTH_PENDING_MAX_BYTES: usize = 64 * 1024;
     const AUTH_PENDING_MAX_SECS: u64 = 10;
 
     let mut decoder = BufferFrameDecoder::new(tls_read, INIT_BUFFER_SIZE);
-    let mut decrypt_buf: Vec<u8> = Vec::with_capacity(16384);
     let mut authenticated = !auth_pending;
     let mut pending_bytes_discarded: usize = 0;
     let auth_deadline = if auth_pending {
@@ -564,7 +585,7 @@ async fn mux_read_loop_inner(
     };
 
     loop {
-        let maybe_frame = match decoder.next().await {
+        let maybe_frame = match decoder.next_mut().await {
             Ok(f) => f,
             Err(e) => {
                 tracing::debug!("mux read loop error: {e}");
@@ -599,14 +620,14 @@ async fn mux_read_loop_inner(
             continue;
         }
 
+        // Copy header and tag into locals before in-place decrypt.
         let header: [u8; TLS_HEADER_SIZE] = frame[..TLS_HEADER_SIZE].try_into().unwrap();
         let mut tag = [0u8; HMAC_SIZE];
         tag.copy_from_slice(&frame[TLS_HEADER_SIZE..TLS_HMAC_HEADER_SIZE]);
 
-        decrypt_buf.clear();
-        decrypt_buf.extend_from_slice(&frame[TLS_HMAC_HEADER_SIZE..]);
-
-        if !aead.decrypt_and_advance(&header, &mut decrypt_buf, &tag) {
+        // Decrypt directly in the decoder's buffer — eliminates per-frame
+        // memcpy into a separate decrypt_buf (~16 KB/frame).
+        if !aead.decrypt_and_advance(&header, &mut frame[TLS_HMAC_HEADER_SIZE..], &tag) {
             if !authenticated {
                 // AuthPending: discard non-AEAD frames (NewSessionTickets etc.)
                 pending_bytes_discarded += frame.len();
@@ -626,10 +647,12 @@ async fn mux_read_loop_inner(
             authenticated = true;
         }
 
-        // Parse all mux frames from the decrypted payload (coalesced)
+        // Parse all mux frames from in-place decrypted payload (coalesced).
+        // Uses BufPool for Data payloads to reuse allocations.
+        let plaintext = &frame[TLS_HMAC_HEADER_SIZE..];
         let mut pos = 0;
-        while pos < decrypt_buf.len() {
-            match MuxFrame::decode(&decrypt_buf[pos..]) {
+        while pos < plaintext.len() {
+            match MuxFrame::decode_pooled(&plaintext[pos..], pool) {
                 Some((mux_frame, consumed)) => {
                     pos += consumed;
                     session.dispatch_inbound(mux_frame);
@@ -691,14 +714,14 @@ pub(crate) async fn mux_server_dispatch(
     let pool_for_read = pool.clone();
     let _read_handle = monoio::spawn(async move {
         use crate::util::BufferFrameDecoder;
-        const INIT_BUFFER_SIZE: usize = 4096;
+        /// Decoder buffer sized for a full TLS record.
+        const INIT_BUFFER_SIZE: usize = TLS_HEADER_SIZE + 16384;
 
         let mut decoder = BufferFrameDecoder::new(tls_read, INIT_BUFFER_SIZE);
         let mut aead = aead_decrypt;
-        let mut decrypt_buf: Vec<u8> = Vec::with_capacity(16384);
 
         loop {
-            let maybe_frame = match decoder.next().await {
+            let maybe_frame = match decoder.next_mut().await {
                 Ok(f) => f,
                 Err(_) => break,
             };
@@ -715,17 +738,17 @@ pub(crate) async fn mux_server_dispatch(
             let mut tag = [0u8; HMAC_SIZE];
             tag.copy_from_slice(&frame[TLS_HEADER_SIZE..TLS_HMAC_HEADER_SIZE]);
 
-            decrypt_buf.clear();
-            decrypt_buf.extend_from_slice(&frame[TLS_HMAC_HEADER_SIZE..]);
-
-            if !aead.decrypt_and_advance(&header, &mut decrypt_buf, &tag) {
+            // Decrypt in-place in the decoder's buffer.
+            if !aead.decrypt_and_advance(&header, &mut frame[TLS_HMAC_HEADER_SIZE..], &tag) {
                 tracing::warn!("mux server: AEAD verification failed");
                 break;
             }
 
+            // Parse mux frames from in-place decrypted payload using pool.
+            let plaintext = &frame[TLS_HMAC_HEADER_SIZE..];
             let mut pos = 0;
-            while pos < decrypt_buf.len() {
-                match MuxFrame::decode(&decrypt_buf[pos..]) {
+            while pos < plaintext.len() {
+                match MuxFrame::decode_pooled(&plaintext[pos..], &pool_for_read) {
                     Some((mux_frame, consumed)) => {
                         pos += consumed;
                         match &mux_frame {
@@ -860,9 +883,10 @@ pub(crate) fn create_client_session(
     // Spawn write loop (with pool for Data payload recycling)
     monoio::spawn(mux_write_loop(tls_write, write_rx, aead_encrypt, session.clone(), pool.clone()));
 
-    // Spawn read loop
+    // Spawn read loop (shares BufPool with write side for buffer recycling)
     let session_for_read = session.clone();
-    monoio::spawn(mux_read_loop(tls_read, session_for_read, aead_decrypt, true));
+    let pool_for_read = pool.clone();
+    monoio::spawn(mux_read_loop(tls_read, session_for_read, aead_decrypt, true, pool_for_read));
 
     // Spawn keepalive ping loop
     let session_for_ping = session.clone();
