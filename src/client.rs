@@ -176,6 +176,27 @@ impl ShadowTlsClient {
         // Mux pool: shared across all connections on this thread.
         // Each monoio thread gets its own pool (Rc, not Arc).
         let mux_pool: Rc<mux::MuxPool> = Rc::new(mux::MuxPool::new(4));
+
+        // Prewarm: establish a mux session before the first connection arrives.
+        // Periodic maintenance replaces dead/evicted sessions in the background.
+        if shared.mux {
+            let client = shared.clone();
+            let pool = mux_pool.clone();
+            monoio::spawn(async move {
+                match client.get_or_create_mux_session(&pool).await {
+                    Ok(_) => tracing::info!("Mux: prewarmed session ready"),
+                    Err(e) => tracing::warn!("Mux: prewarm failed: {e:#}"),
+                }
+                loop {
+                    monoio::time::sleep(Duration::from_secs(5)).await;
+                    pool.cleanup();
+                    if pool.get_session().is_none() {
+                        let _ = client.get_or_create_mux_session(&pool).await;
+                    }
+                }
+            });
+        }
+
         loop {
             match listener.accept().await {
                 Ok((mut conn, addr)) => {
@@ -245,12 +266,12 @@ impl ShadowTlsClient {
         Ok(())
     }
 
-    /// Obtain a mux session: reuse existing or create new with serialization.
+    /// Obtain a mux session and its buffer pool: reuse existing or create new.
     /// Only one task creates a session at a time; others poll and wait.
     async fn get_or_create_mux_session(
         &self,
         pool: &mux::MuxPool,
-    ) -> anyhow::Result<Rc<mux::MuxSession>> {
+    ) -> anyhow::Result<(Rc<mux::MuxSession>, Rc<mux::BufPool>)> {
         const WAIT_TIMEOUT: Duration = Duration::from_secs(15);
         const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -300,7 +321,7 @@ impl ShadowTlsClient {
     async fn create_mux_session(
         &self,
         pool: &mux::MuxPool,
-    ) -> anyhow::Result<Rc<mux::MuxSession>> {
+    ) -> anyhow::Result<(Rc<mux::MuxSession>, Rc<mux::BufPool>)> {
         let addr = resolve(&self.target_addr).await?;
         let mut stream = TcpStream::connect_addr_with_config(
             addr,
@@ -326,26 +347,26 @@ impl ShadowTlsClient {
         tracing::info!("Mux: new TLS session established");
         let aead_c2s = FrameAead::new(&self.password, &server_random, b"c2s");
         let aead_s2c = FrameAead::new(&self.password, &server_random, b"s2c");
-        let s = mux::create_client_session(stream, aead_c2s, aead_s2c);
-        pool.add_session(s.clone());
-        Ok(s)
+        let (s, bp) = mux::create_client_session(stream, aead_c2s, aead_s2c);
+        pool.add_session(s.clone(), bp.clone());
+        Ok((s, bp))
     }
 
     /// Mux relay: reuse an existing TLS connection or create a new one.
     /// Multiple client connections share a single TLS session via stream multiplexing.
     async fn relay_mux(&self, in_stream: TcpStream, pool: &mux::MuxPool) -> anyhow::Result<()> {
-        let session = self.get_or_create_mux_session(pool).await?;
+        let (session, buf_pool) = self.get_or_create_mux_session(pool).await?;
 
-        // Open a new stream on the mux session
         let (stream_id, mut data_rx) = session.open_stream();
         tracing::debug!("Mux stream {stream_id} opened");
 
         let (in_read, in_write) = in_stream.into_split();
 
         let session_for_write = session.clone();
+        let pool_for_write = buf_pool.clone();
         let sid = stream_id;
         let _ = monoio::join!(
-            // Client app -> mux stream
+            // Client app -> mux stream (use pool for allocation)
             async {
                 let mut in_read = in_read;
                 let mut buf = vec![0u8; crate::mux::MAX_MUX_DATA];
@@ -358,18 +379,19 @@ impl ShadowTlsClient {
                             return;
                         }
                         Ok(n) => {
-                            if !session_for_write.send_data(sid, buf[..n].to_vec()) {
+                            if !session_for_write.send_data(sid, buf_pool.take(&buf[..n])) {
                                 return;
                             }
                         }
                     }
                 }
             },
-            // Mux stream -> client app
+            // Mux stream -> client app (recycle buffers after write)
             async {
                 let mut in_write = in_write;
                 while let Some(data) = data_rx.recv().await {
-                    let (res, _) = in_write.write_all(data).await;
+                    let (res, written_buf) = in_write.write_all(data).await;
+                    pool_for_write.put(written_buf);
                     if res.is_err() {
                         return;
                     }

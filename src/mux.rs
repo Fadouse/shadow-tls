@@ -43,7 +43,48 @@ pub(crate) const MAX_MUX_DATA: usize = MAX_INNER_PAYLOAD - 7;
 /// Max streams per mux session.
 const DEFAULT_MAX_STREAMS: usize = 128;
 /// Idle timeout for a mux session with no active streams.
-const MUX_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// With keepalive pings every 15s resetting the timer, this only triggers
+/// when the ping loop itself has died (session shutdown, write channel closed).
+const MUX_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+/// Keepalive ping interval for idle mux sessions.
+const MUX_PING_INTERVAL: Duration = Duration::from_secs(15);
+
+// ---------------------------------------------------------------------------
+// BufPool — thread-local buffer pool to avoid per-chunk Vec allocation
+// ---------------------------------------------------------------------------
+
+/// Reusable buffer pool for the mux data path.
+///
+/// Pre-allocates `MAX_MUX_DATA`-capacity Vecs so `extend_from_slice` never
+/// reallocs on the hot path. Buffers are returned after the consumer writes
+/// them to TCP. Drop-path leaks (write failures, RST) are bounded by the
+/// pool cap (64 entries, ~1 MB max retained memory).
+pub(crate) struct BufPool {
+    pool: RefCell<Vec<Vec<u8>>>,
+}
+
+impl BufPool {
+    pub(crate) fn new() -> Self {
+        Self { pool: RefCell::new(Vec::new()) }
+    }
+
+    /// Take a buffer from the pool (or allocate a new one), fill with `data`.
+    pub(crate) fn take(&self, data: &[u8]) -> Vec<u8> {
+        let mut v = self.pool.borrow_mut().pop()
+            .unwrap_or_else(|| Vec::with_capacity(MAX_MUX_DATA));
+        v.clear();
+        v.extend_from_slice(data);
+        v
+    }
+
+    /// Return a consumed buffer to the pool. Drops silently if pool is full.
+    pub(crate) fn put(&self, buf: Vec<u8>) {
+        let mut pool = self.pool.borrow_mut();
+        if pool.len() < 64 {
+            pool.push(buf);
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // MuxFrame — parsed representation of a mux command
@@ -327,10 +368,8 @@ impl MuxSession {
 // ---------------------------------------------------------------------------
 
 pub(crate) struct MuxPool {
-    sessions: RefCell<Vec<Rc<MuxSession>>>,
+    sessions: RefCell<Vec<(Rc<MuxSession>, Rc<BufPool>)>>,
     max_sessions: usize,
-    /// Serializes session creation so concurrent connections don't each
-    /// independently create their own TLS session (thundering herd).
     creating: Cell<bool>,
 }
 
@@ -343,10 +382,10 @@ impl MuxPool {
         }
     }
 
-    /// Get a session with available capacity, or None if a new one is needed.
-    pub(crate) fn get_session(&self) -> Option<Rc<MuxSession>> {
+    /// Get a session with available capacity and its associated buffer pool.
+    pub(crate) fn get_session(&self) -> Option<(Rc<MuxSession>, Rc<BufPool>)> {
         let sessions = self.sessions.borrow();
-        sessions.iter().find(|s| s.has_capacity()).cloned()
+        sessions.iter().find(|(s, _)| s.has_capacity()).cloned()
     }
 
     /// Try to acquire the creation lock. Returns true if this caller
@@ -363,22 +402,21 @@ impl MuxPool {
         self.creating.set(false);
     }
 
-    /// Register a new session. Drops the oldest idle session if at capacity.
-    pub(crate) fn add_session(&self, session: Rc<MuxSession>) {
+    /// Register a new session with its buffer pool. Evicts oldest idle if at capacity.
+    pub(crate) fn add_session(&self, session: Rc<MuxSession>, pool: Rc<BufPool>) {
         let mut sessions = self.sessions.borrow_mut();
         if sessions.len() >= self.max_sessions {
-            // Evict the first idle (or dead) session to make room
-            if let Some(idx) = sessions.iter().position(|s| !s.is_alive() || s.active_count.get() == 0) {
+            if let Some(idx) = sessions.iter().position(|(s, _)| !s.is_alive() || s.active_count.get() == 0) {
                 sessions.swap_remove(idx);
             }
         }
-        sessions.push(session);
+        sessions.push((session, pool));
     }
 
     /// Remove dead sessions and sessions idle longer than MUX_IDLE_TIMEOUT.
     pub(crate) fn cleanup(&self) {
         let now = Instant::now();
-        self.sessions.borrow_mut().retain(|s| {
+        self.sessions.borrow_mut().retain(|(s, _)| {
             if !s.is_alive() {
                 return false;
             }
@@ -407,11 +445,22 @@ pub(crate) async fn mux_write_loop(
     mut rx: local_sync::mpsc::unbounded::Rx<MuxFrame>,
     mut aead: FrameAead,
     session: Rc<MuxSession>,
+    pool: Rc<BufPool>,
 ) {
     // Single buffer: [TLS_HDR:5][TAG:16][mux_frames...][padding...]
     // Frames are encoded directly here — no intermediate Vec allocation.
     let mut buffer = Vec::with_capacity(32768);
     let mut padding = PaddingState::new();
+
+    // Encode a frame into buffer, then recycle any Data payload back to pool.
+    #[inline]
+    fn encode_and_recycle(frame: MuxFrame, buf: &mut Vec<u8>, pool: &BufPool) {
+        frame.encode(buf);
+        // After encode borrows &frame, destructure to reclaim owned payload
+        if let MuxFrame::Data { payload, .. } = frame {
+            pool.put(payload);
+        }
+    }
 
     let _: () = async {
     loop {
@@ -427,13 +476,13 @@ pub(crate) async fn mux_write_loop(
         buffer[1] = TLS_MAJOR;
         buffer[2] = TLS_MINOR.0;
 
-        // Encode first frame directly into buffer (zero-copy: no intermediate Vec)
-        first.encode(&mut buffer);
+        // Encode first frame + recycle its Data payload if any
+        encode_and_recycle(first, &mut buffer, &pool);
 
-        // Coalesce: drain channel for more frames
+        // Coalesce: drain channel for more frames (all recycled)
         while buffer.len() - TLS_HMAC_HEADER_SIZE < MAX_INNER_PAYLOAD - 64 {
             match rx.try_recv() {
-                Ok(f) => f.encode(&mut buffer),
+                Ok(f) => encode_and_recycle(f, &mut buffer, &pool),
                 Err(_) => break,
             }
         }
@@ -609,6 +658,7 @@ pub(crate) async fn mux_server_dispatch(
     let (write_tx, write_rx) = local_sync::mpsc::unbounded::channel();
 
     let streams: Rc<RefCell<HashMap<u32, StreamEntry>>> = Rc::new(RefCell::new(HashMap::new()));
+    let pool = Rc::new(BufPool::new());
 
     let session = Rc::new(MuxSession {
         write_tx,
@@ -631,12 +681,14 @@ pub(crate) async fn mux_server_dispatch(
             stream_id,
             data_addr,
             nodelay,
+            pool.clone(),
         );
     }
 
     // Spawn the write loop
     let session_for_read = session.clone();
     let nodelay_val = nodelay;
+    let pool_for_read = pool.clone();
     let _read_handle = monoio::spawn(async move {
         use crate::util::BufferFrameDecoder;
         const INIT_BUFFER_SIZE: usize = 4096;
@@ -683,6 +735,7 @@ pub(crate) async fn mux_server_dispatch(
                                     *stream_id,
                                     data_addr,
                                     nodelay_val,
+                                    pool_for_read.clone(),
                                 );
                             }
                             _ => {
@@ -700,7 +753,7 @@ pub(crate) async fn mux_server_dispatch(
     });
 
     // Run the write loop in the current task
-    mux_write_loop(tls_write, write_rx, aead_encrypt, session.clone()).await;
+    mux_write_loop(tls_write, write_rx, aead_encrypt, session.clone(), pool).await;
 
     Ok(())
 }
@@ -712,6 +765,7 @@ fn spawn_server_stream(
     stream_id: u32,
     data_addr: std::net::SocketAddr,
     nodelay: bool,
+    pool: Rc<BufPool>,
 ) {
     let (data_tx, mut data_rx) = local_sync::mpsc::unbounded::channel::<Vec<u8>>();
 
@@ -737,11 +791,11 @@ fn spawn_server_stream(
 
         let (data_read, data_write) = data_stream.into_split();
 
-        // Bidirectional relay: mux stream <-> data server
         let session_for_read = session_clone.clone();
+        let pool_for_write = pool.clone();
         let sid = stream_id;
         let _ = monoio::join!(
-            // Data server -> mux stream (read from data server, send via mux)
+            // Data server -> mux stream
             async {
                 let mut data_read = data_read;
                 let mut buf = vec![0u8; MAX_MUX_DATA];
@@ -754,18 +808,19 @@ fn spawn_server_stream(
                             return;
                         }
                         Ok(n) => {
-                            if !session_for_read.send_data(sid, buf[..n].to_vec()) {
+                            if !session_for_read.send_data(sid, pool.take(&buf[..n])) {
                                 return;
                             }
                         }
                     }
                 }
             },
-            // Mux stream -> data server (receive from mux, write to data server)
+            // Mux stream -> data server (recycle buffers after write)
             async {
                 let mut data_write = data_write;
                 while let Some(data) = data_rx.recv().await {
-                    let (res, _) = data_write.write_all(data).await;
+                    let (res, written_buf) = data_write.write_all(data).await;
+                    pool_for_write.put(written_buf);
                     if res.is_err() {
                         return;
                     }
@@ -786,9 +841,10 @@ pub(crate) fn create_client_session(
     tls: TcpStream,
     aead_encrypt: FrameAead,
     aead_decrypt: FrameAead,
-) -> Rc<MuxSession> {
+) -> (Rc<MuxSession>, Rc<BufPool>) {
     let (write_tx, write_rx) = local_sync::mpsc::unbounded::channel();
     let streams = Rc::new(RefCell::new(HashMap::new()));
+    let pool = Rc::new(BufPool::new());
 
     let session = Rc::new(MuxSession {
         write_tx,
@@ -801,13 +857,31 @@ pub(crate) fn create_client_session(
 
     let (tls_read, tls_write) = tls.into_split();
 
-    // Spawn write loop
-    monoio::spawn(mux_write_loop(tls_write, write_rx, aead_encrypt, session.clone()));
+    // Spawn write loop (with pool for Data payload recycling)
+    monoio::spawn(mux_write_loop(tls_write, write_rx, aead_encrypt, session.clone(), pool.clone()));
 
     // Spawn read loop
     let session_for_read = session.clone();
-    // Client side: auth_pending=true to drain handshake residue (NewSessionTickets etc.)
     monoio::spawn(mux_read_loop(tls_read, session_for_read, aead_decrypt, true));
 
-    session
+    // Spawn keepalive ping loop
+    let session_for_ping = session.clone();
+    monoio::spawn(async move {
+        let mut ping_id: u32 = 0;
+        loop {
+            monoio::time::sleep(MUX_PING_INTERVAL).await;
+            if !session_for_ping.is_alive() {
+                return;
+            }
+            ping_id = ping_id.wrapping_add(1);
+            if session_for_ping.write_tx.send(MuxFrame::Ping { ping_id }).is_err() {
+                return;
+            }
+            // Reset idle timer unconditionally. No TOCTOU: monoio single-threaded,
+            // no await points between here and end of block.
+            session_for_ping.idle_since.set(Some(Instant::now()));
+        }
+    });
+
+    (session, pool)
 }
