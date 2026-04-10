@@ -97,7 +97,7 @@ Certificate verification is disabled in the BoringSSL context — boring is used
 
 ## Key Derivation
 
-After the handshake, both sides derive per-direction keys using **HKDF-SHA256**:
+After the handshake, both sides derive initial per-direction keys using **HKDF-SHA256**:
 
 ```
 okm = HKDF-SHA256(IKM=password, salt=ServerRandom, info=direction)  →  28 bytes
@@ -108,6 +108,62 @@ Where `direction` is `"c2s"` or `"s2c"`. Each 28-byte output is split into:
 - **Base nonce** (last 12 bytes): base value for GCM nonce construction
 
 Using ServerRandom as the HKDF salt binds keys to the specific TLS session, preventing cross-session replay.
+
+## Perfect Forward Secrecy (PFS)
+
+The initial key derivation depends only on the long-term `password` and the public `ServerRandom`. If the password is compromised in the future, an adversary who recorded historical traffic could decrypt all past sessions. To prevent this, ShadowTLS performs a post-handshake **X25519 ephemeral key exchange** over the authenticated AEAD channel.
+
+### 0-RTT Design (Non-Mux)
+
+The key exchange adds **zero additional RTT** to the data path. The client sends its ephemeral public key and immediately begins data relay; the server responds asynchronously.
+
+```
+Client                          Server
+  |                               |
+  |=== TLS handshake (relayed) ===|
+  |                               |
+  | Derive initial AEAD keys      | Derive initial AEAD keys
+  |                               |
+  |--- CMD_EPHEMERAL (pubkey) --->| (first AEAD frame)
+  |--- preamble + data ---------->| Generate keypair, compute DH
+  |                               |--- CMD_EPHEMERAL (pubkey) --->
+  |                               | Rekey s2c immediately
+  |                               | Install pending rekey on c2s
+  | Receive CMD_EPHEMERAL         |
+  | Compute DH, rekey both AEADs  |
+  |--- data (new c2s key) ------->| Dual-key c2s detects transition
+  |                               | Drop old c2s key permanently
+```
+
+During the brief transition window, the server maintains **dual-key decryption** on the c2s direction: it tries the current (old) key first, and on failure tries the pending (new) key. When the new key succeeds, the old key is permanently dropped. Failed decryption attempts do not advance the sequence counter, ensuring state consistency.
+
+### 1-RTT Design (Mux)
+
+For multiplexed sessions, the PFS exchange uses a blocking 1-RTT approach (client waits for server response before proceeding). This cost is amortized across all multiplexed connections sharing the session.
+
+### CMD_EPHEMERAL Frame Format
+
+```
+CMD = 0x09  [32B X25519 public key]
+```
+
+### Rekeyed Key Derivation
+
+After DH, both sides derive new AEAD keys:
+
+```
+shared_secret = X25519(my_ephemeral_secret, peer_ephemeral_public)
+okm = HKDF-SHA256(IKM=shared_secret, salt=ServerRandom, info=direction)  →  28 bytes
+```
+
+The ephemeral private keys are discarded immediately after DH computation. Even if the password is compromised later, the shared secret cannot be recovered from recorded traffic.
+
+### Security Properties
+
+- **True PFS**: session keys depend on ephemeral DH, not just the long-term password
+- **Authenticated exchange**: initial AEAD protects the key exchange — MITM requires knowing the password
+- **Zero overhead for mux**: PFS exchange happens once per session, amortized across all streams
+- **Backward compatible framing**: CMD_EPHEMERAL uses the same inner framing as existing commands
 
 ## Per-Frame AEAD (AES-128-GCM)
 
@@ -210,6 +266,7 @@ Server tail padding is heavier (higher probability, wider range) because real se
 | Traffic signature detection | BoringSSL produces Chrome-identical ClientHello (JA3/JA4, X25519Kyber768, GREASE) |
 | Active probing | Failed session_id HMAC → transparent SNI proxy fallback |
 | Traffic hijacking (data) | Per-frame AES-128-GCM with direction-separated keys |
+| Password compromise (historical traffic) | X25519 ephemeral DH provides true perfect forward secrecy |
 | Cross-session replay | HKDF salt = ServerRandom (unique per session) |
 | In-session replay/reorder | 64-bit sequence number in GCM nonce |
 | Header manipulation | TLS record header as GCM AAD |
@@ -291,10 +348,17 @@ The client **MUST** produce a Chrome-identical ClientHello. This implementation 
 4. For TLS 1.3: append random ApplicationData as synthetic Finished.
 5. Send client flight. If TLS 1.2: send fake request and bail.
 
+**Stage 1.5 — PFS Key Exchange (0-RTT):**
+1. Generate X25519 ephemeral keypair.
+2. Send CMD_EPHEMERAL (0x09) + 32-byte public key as the first AEAD frame.
+3. Immediately enter data relay (do not wait for server response).
+4. When CMD_EPHEMERAL response arrives in the decrypt stream: compute DH shared secret, rekey both AEADs.
+
 **Stage 2 — Data relay (no TLS library required):**
-1. Derive `key_c2s` and `key_s2c` via HKDF-SHA256(password, ServerRandom, direction).
-2. **Reading from server**: parse ApplicationData, extract 16B GCM tag, decrypt with `key_s2c`. Parse inner frame, forward user data, discard padding.
-3. **Writing to server**: build inner frame (CMD + DATA_LEN + data + padding), encrypt with `key_c2s`, wrap in ApplicationData.
+1. Derive initial `key_c2s` and `key_s2c` via HKDF-SHA256(password, ServerRandom, direction).
+2. After PFS rekey: derive final keys via HKDF-SHA256(shared_secret, ServerRandom, direction).
+3. **Reading from server**: parse ApplicationData, extract 16B GCM tag, decrypt with `key_s2c`. Parse inner frame, forward user data, discard padding. Handle CMD_EPHEMERAL for PFS rekey.
+4. **Writing to server**: build inner frame (CMD + DATA_LEN + data + padding), encrypt with `key_c2s`, wrap in ApplicationData.
 
 ## Server Implementation
 
@@ -304,7 +368,15 @@ The client **MUST** produce a Chrome-identical ClientHello. This implementation 
 3. Bidirectional relay until first AEAD-authenticated ApplicationData frame arrives from client.
 4. On AEAD match: shutdown handshake server connection, signal verbatim relay to stop.
 
+**Stage 1.5 — PFS Key Exchange:**
+1. If first AEAD frame is CMD_EPHEMERAL: parse client's X25519 public key.
+2. Generate server ephemeral keypair, send CMD_EPHEMERAL response.
+3. Compute DH shared secret.
+4. Non-mux (0-RTT): rekey `key_s2c` immediately, install pending rekey on `key_c2s` (dual-key transition).
+5. Mux (1-RTT): rekey both directions, then read next data frame.
+
 **Stage 2 — Data relay:**
-1. Derive `key_c2s` and `key_s2c` via HKDF-SHA256(password, ServerRandom, direction).
-2. **Client → Data Server**: decrypt with `key_c2s`, parse inner frame, forward user data.
-3. **Data Server → Client**: encrypt with `key_s2c`, build inner frame, apply padding.
+1. Derive initial `key_c2s` and `key_s2c` via HKDF-SHA256(password, ServerRandom, direction).
+2. After PFS: derive final keys via HKDF-SHA256(shared_secret, ServerRandom, direction).
+3. **Client → Data Server**: decrypt with `key_c2s`, parse inner frame, forward user data.
+4. **Data Server → Client**: encrypt with `key_s2c`, build inner frame, apply padding.

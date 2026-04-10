@@ -27,6 +27,7 @@ rand = "0.8"
 rustc-hash = "1"
 sha1 = "0.10"
 sha2 = "0.10"
+x25519-dalek = { version = "2", features = ["getrandom", "static_secrets"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = { version = "1", features = ["derive"] }

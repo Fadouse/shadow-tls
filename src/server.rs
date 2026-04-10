@@ -17,11 +17,13 @@ use monoio::{
 };
 use serde::Deserialize;
 
+use x25519_dalek::{PublicKey, StaticSecret};
+
 use crate::{
     util::{
         bind_with_pretty_error, copy_bidirectional, mod_tcp_conn, prelude::*,
-        resolve, support_tls13, verified_relay, CursorExt, FrameAead, Hmac,
-        TrafficRole, V3Mode,
+        read_first_data_frame, resolve, send_ephemeral_key, support_tls13,
+        verified_relay, CursorExt, FrameAead, Hmac, TrafficRole, V3Mode,
     },
     WildcardSNI,
 };
@@ -294,7 +296,7 @@ impl ShadowTlsServer {
 
         // stage 1.3.1: create per-frame AEAD with direction-separated keys
         let mut frame_aead_c2s = FrameAead::new(&self.password, &server_random, b"c2s");
-        let frame_aead_s2c = FrameAead::new(&self.password, &server_random, b"s2c");
+        let mut frame_aead_s2c = FrameAead::new(&self.password, &server_random, b"s2c");
 
         // Pre-resolve data server address during handshake relay to save DNS latency.
         // This overlaps DNS resolution with the handshake relay phase.
@@ -352,12 +354,80 @@ impl ShadowTlsServer {
         // early drop useless resources
         drop(first_server_frame);
 
-        let tls_stream = unsafe { c_read.reunite(c_write).unwrap_unchecked() };
+        let mut tls_stream = unsafe { c_read.reunite(c_write).unwrap_unchecked() };
 
-        // Detect mux mode: if the first decrypted payload starts with CMD_MUX_SYN (0x02),
-        // the client is using multiplexing. Otherwise it's legacy 1:1 relay.
-        if self.mux && !pure_data.is_empty() && pure_data[0] == CMD_MUX_SYN {
-            // Parse the SYN frame from pure_data (it's the raw inner payload)
+        // PFS: if the first authenticated frame is CMD_EPHEMERAL, perform key exchange.
+        // Non-mux uses 0-RTT (dual-key c2s transition in relay).
+        // Mux uses 1-RTT (blocking exchange before mux dispatch).
+        if !pure_data.is_empty() && pure_data[0] == CMD_EPHEMERAL {
+            let peer_key = crate::util::parse_inner_frame(&pure_data)
+                .and_then(|(cmd, data)| {
+                    if cmd == CMD_EPHEMERAL && data.len() == 32 {
+                        let mut k = [0u8; 32];
+                        k.copy_from_slice(data);
+                        Some(k)
+                    } else {
+                        None
+                    }
+                })
+                .ok_or_else(|| anyhow::anyhow!("malformed CMD_EPHEMERAL frame"))?;
+
+            let secret = StaticSecret::random_from_rng(rand::thread_rng());
+            let my_public = PublicKey::from(&secret);
+            send_ephemeral_key(&mut tls_stream, &mut frame_aead_s2c, my_public.as_bytes())
+                .await?;
+
+            let peer_public = PublicKey::from(peer_key);
+            let shared_secret = secret.diffie_hellman(&peer_public);
+
+            if self.mux {
+                // Mux: 1-RTT — rekey both AEADs, then read first data frame
+                frame_aead_c2s.rekey(shared_secret.as_bytes(), &server_random, b"c2s");
+                frame_aead_s2c.rekey(shared_secret.as_bytes(), &server_random, b"s2c");
+                tracing::debug!("PFS key exchange completed (mux, 1-RTT)");
+
+                let pure_data =
+                    read_first_data_frame(&mut tls_stream, &mut frame_aead_c2s).await?;
+                if !pure_data.is_empty() && pure_data[0] == CMD_MUX_SYN {
+                    if let Some((syn_frame, _)) = crate::mux::MuxFrame::decode(&pure_data) {
+                        tracing::info!("Mux mode detected, entering mux dispatcher");
+                        crate::mux::mux_server_dispatch(
+                            tls_stream,
+                            frame_aead_s2c,
+                            frame_aead_c2s,
+                            &self.target_addr,
+                            self.nodelay,
+                            syn_frame,
+                        )
+                        .await?;
+                    }
+                }
+            } else {
+                // Non-mux: 0-RTT — rekey s2c immediately, set pending rekey on c2s.
+                // The relay's dual-key decoder handles the transition seamlessly.
+                frame_aead_s2c.rekey(shared_secret.as_bytes(), &server_random, b"s2c");
+                frame_aead_c2s.set_pending_rekey(
+                    shared_secret.as_bytes(),
+                    &server_random,
+                    b"c2s",
+                );
+                tracing::debug!("PFS key exchange completed (non-mux, 0-RTT)");
+
+                let mut data_stream = TcpStream::connect_addr(data_addr).await?;
+                mod_tcp_conn(&mut data_stream, true, self.nodelay);
+                verified_relay(
+                    data_stream,
+                    tls_stream,
+                    frame_aead_s2c,
+                    frame_aead_c2s,
+                    !use_tls13,
+                    false,
+                    TrafficRole::Server,
+                )
+                .await;
+            }
+        } else if self.mux && !pure_data.is_empty() && pure_data[0] == CMD_MUX_SYN {
+            // No PFS, mux mode
             if let Some((syn_frame, _)) = crate::mux::MuxFrame::decode(&pure_data) {
                 tracing::info!("Mux mode detected, entering mux dispatcher");
                 crate::mux::mux_server_dispatch(
@@ -371,7 +441,7 @@ impl ShadowTlsServer {
                 .await?;
             }
         } else {
-            // Legacy 1:1 relay
+            // No PFS, legacy 1:1 relay
             let mut data_stream = TcpStream::connect_addr(data_addr).await?;
             mod_tcp_conn(&mut data_stream, true, self.nodelay);
             let (res, _) = data_stream.write_all(pure_data).await;
@@ -576,6 +646,11 @@ async fn copy_by_frame_until_aead_matches(
                     Some((CMD_MUX_SYN, _)) => {
                         // Mux mode: return the entire decrypted inner payload
                         // (including CMD byte) so the caller can parse the SYN.
+                        return Ok(decrypt_buf.clone());
+                    }
+                    Some((CMD_EPHEMERAL, _)) => {
+                        // PFS key exchange: return entire inner payload
+                        // (including CMD byte) so the caller can parse the pubkey.
                         return Ok(decrypt_buf.clone());
                     }
                     Some((CMD_PADDING, _)) | Some((CMD_DATA, _)) => {

@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -8,12 +9,14 @@ use monoio::net::{TcpConnectOpts, TcpStream};
 use rand::seq::SliceRandom;
 use serde::{de::Visitor, Deserialize};
 
+use x25519_dalek::{PublicKey, StaticSecret};
+
 use crate::{
     boring_tls,
     mux,
     util::{
-        bind_with_pretty_error, mod_tcp_conn, resolve, verified_relay, FrameAead,
-        TrafficRole, V3Mode,
+        bind_with_pretty_error, mod_tcp_conn, resolve, send_ephemeral_key, FrameAead,
+        PfsContext, PfsState, TrafficRole, V3Mode,
     },
 };
 
@@ -251,17 +254,33 @@ impl ShadowTlsClient {
         }
 
         tracing::debug!("Authorized, ServerRandom extracted: {server_random:?}");
-        let frame_aead_c2s = FrameAead::new(&self.password, &server_random, b"c2s");
+        let mut frame_aead_c2s = FrameAead::new(&self.password, &server_random, b"c2s");
         let frame_aead_s2c = FrameAead::new(&self.password, &server_random, b"s2c");
 
-        verified_relay(
+        // 0-RTT PFS: send ephemeral pubkey, then immediately enter relay.
+        // The decrypt side will handle the server's response asynchronously.
+        let secret = StaticSecret::random_from_rng(rand::thread_rng());
+        let my_public = PublicKey::from(&secret);
+        send_ephemeral_key(&mut stream, &mut frame_aead_c2s, my_public.as_bytes()).await?;
+
+        let pfs: PfsState = Rc::new(PfsContext {
+            our_secret: secret.to_bytes(),
+            server_random,
+            decrypt_dir: b"s2c",
+            encrypt_dir: b"c2s",
+            shared_secret: Cell::new(None),
+        });
+
+        crate::util::verified_relay_with_coalesce(
             in_stream,
             stream,
             frame_aead_c2s,
             frame_aead_s2c,
             !tls13,
             true,
+            0,
             TrafficRole::Client,
+            Some(pfs),
         )
         .await;
         Ok(())
@@ -346,8 +365,21 @@ impl ShadowTlsClient {
         }
 
         tracing::info!("Mux: new TLS session established");
-        let aead_c2s = FrameAead::new(&self.password, &server_random, b"c2s");
-        let aead_s2c = FrameAead::new(&self.password, &server_random, b"s2c");
+        let mut aead_c2s = FrameAead::new(&self.password, &server_random, b"c2s");
+        let mut aead_s2c = FrameAead::new(&self.password, &server_random, b"s2c");
+
+        // PFS: ephemeral X25519 key exchange over the authenticated channel.
+        // Mux uses 1-RTT PFS (cost amortized over many multiplexed connections).
+        let secret = StaticSecret::random_from_rng(rand::thread_rng());
+        let my_public = PublicKey::from(&secret);
+        send_ephemeral_key(&mut stream, &mut aead_c2s, my_public.as_bytes()).await?;
+        let peer_public =
+            crate::util::read_ephemeral_key(&mut stream, &mut aead_s2c).await?;
+        let peer_public = PublicKey::from(peer_public);
+        let shared_secret = secret.diffie_hellman(&peer_public);
+        aead_c2s.rekey(shared_secret.as_bytes(), &server_random, b"c2s");
+        aead_s2c.rekey(shared_secret.as_bytes(), &server_random, b"s2c");
+        tracing::debug!("Mux: PFS key exchange completed");
         let (s, bp) = mux::create_client_session(stream, aead_c2s, aead_s2c);
         pool.add_session(s.clone(), bp.clone());
         Ok((s, bp))

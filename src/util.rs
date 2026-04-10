@@ -1,6 +1,8 @@
 use std::{
+    cell::Cell,
     io::{ErrorKind, Read},
     net::ToSocketAddrs,
+    rc::Rc,
     time::Duration,
 };
 
@@ -9,7 +11,8 @@ use local_sync::oneshot::{Receiver, Sender};
 use monoio::{
     buf::IoBufMut,
     io::{
-        AsyncReadRent, AsyncWriteRent, AsyncWriteRentExt, CancelableAsyncReadRent, Canceller,
+        AsyncReadRent, AsyncReadRentExt, AsyncWriteRent, AsyncWriteRentExt,
+        CancelableAsyncReadRent, Canceller,
         Splitable,
     },
     net::{ListenerOpts, TcpListener, TcpStream},
@@ -61,6 +64,9 @@ pub(crate) mod prelude {
     pub(crate) const CMD_DATA: u8 = 0x01;
     /// Inner command: padding/waste (receiver discards).
     pub(crate) const CMD_PADDING: u8 = 0x00;
+
+    /// Inner command: ephemeral X25519 public key for forward secrecy.
+    pub(crate) const CMD_EPHEMERAL: u8 = 0x09;
 
     // --- Mux commands (multiplexing protocol) ---
     pub(crate) const CMD_MUX_SYN: u8 = 0x02;
@@ -216,6 +222,17 @@ pub(crate) struct FrameAead {
     cipher: Aes128Gcm,
     base_nonce: [u8; 12],
     seq: u64,
+    /// Pending PFS rekey for 0-RTT transition. During the brief window after
+    /// the server sends CMD_EPHEMERAL but before the client switches keys,
+    /// the decoder tries the current key first, then the pending key.
+    /// When the pending key succeeds, it replaces the current key permanently.
+    pending: Option<PendingRekey>,
+}
+
+struct PendingRekey {
+    cipher: Aes128Gcm,
+    base_nonce: [u8; 12],
+    seq: u64,
 }
 
 impl FrameAead {
@@ -236,7 +253,57 @@ impl FrameAead {
             cipher,
             base_nonce,
             seq: 0,
+            pending: None,
         }
+    }
+
+    /// Rekey with X25519 shared secret for perfect forward secrecy.
+    ///
+    /// Derives fresh key material via HKDF-SHA256:
+    ///   IKM = X25519 shared secret (32 bytes, ephemeral)
+    ///   salt = server_random (32 bytes, binds to this TLS session)
+    ///   info = direction (b"c2s" or b"s2c")
+    ///
+    /// Resets the sequence counter to 0 after rekeying.
+    pub(crate) fn rekey(&mut self, shared_secret: &[u8; 32], server_random: &[u8], direction: &[u8]) {
+        let hk = Hkdf::<Sha256>::new(Some(server_random), shared_secret);
+        let mut okm = [0u8; 28];
+        hk.expand(direction, &mut okm)
+            .expect("HKDF-SHA256 expand failed");
+        let key: [u8; 16] = okm[..16].try_into().unwrap();
+        self.base_nonce = [0u8; 12];
+        self.base_nonce.copy_from_slice(&okm[16..28]);
+        self.cipher =
+            <Aes128Gcm as AesKeyInit>::new_from_slice(&key).expect("AES-128-GCM key init failed");
+        self.seq = 0;
+        self.pending = None;
+    }
+
+    /// Install a pending PFS rekey for 0-RTT dual-key transition.
+    ///
+    /// The current key continues to work. When the first frame fails the
+    /// current key but succeeds with the pending key, the pending key
+    /// permanently replaces the current key.
+    pub(crate) fn set_pending_rekey(
+        &mut self,
+        shared_secret: &[u8; 32],
+        server_random: &[u8],
+        direction: &[u8],
+    ) {
+        let hk = Hkdf::<Sha256>::new(Some(server_random), shared_secret);
+        let mut okm = [0u8; 28];
+        hk.expand(direction, &mut okm)
+            .expect("HKDF-SHA256 expand failed");
+        let key: [u8; 16] = okm[..16].try_into().unwrap();
+        let mut base_nonce = [0u8; 12];
+        base_nonce.copy_from_slice(&okm[16..28]);
+        let cipher =
+            <Aes128Gcm as AesKeyInit>::new_from_slice(&key).expect("AES-128-GCM key init failed");
+        self.pending = Some(PendingRekey {
+            cipher,
+            base_nonce,
+            seq: 0,
+        });
     }
 
     /// Build the 12-byte nonce: base_nonce XOR (seq_be64 right-aligned to 12 bytes).
@@ -271,12 +338,24 @@ impl FrameAead {
     /// Decrypt payload in-place and verify the GCM tag. Advances seq only on success.
     /// `header` = TLS record header (5 bytes, used as AAD).
     /// `payload` is modified in-place to plaintext on success.
+    ///
+    /// If a pending PFS rekey is installed, on primary failure the payload is
+    /// restored and retried with the pending key. If the pending key succeeds,
+    /// it permanently replaces the primary key.
     pub(crate) fn decrypt_and_advance(
         &mut self,
         header: &[u8],
         payload: &mut [u8],
         tag: &[u8; HMAC_SIZE],
     ) -> bool {
+        // Save payload for retry if pending rekey exists.
+        // AES-GCM decrypt modifies payload in-place even on failure.
+        let saved = if self.pending.is_some() {
+            Some(payload.to_vec())
+        } else {
+            None
+        };
+
         let nonce = self.make_nonce();
         let gcm_tag = aes_gcm::Tag::from_slice(tag);
         match self
@@ -285,10 +364,37 @@ impl FrameAead {
         {
             Ok(()) => {
                 self.seq += 1;
-                true
+                return true;
             }
-            Err(_) => false,
+            Err(_) => {}
         }
+
+        // Primary failed — try pending key if available
+        if let (Some(saved_payload), Some(pending)) = (saved, self.pending.as_mut()) {
+            payload.copy_from_slice(&saved_payload);
+            let mut pnonce = pending.base_nonce;
+            let tail =
+                u64::from_be_bytes(pnonce[4..12].try_into().unwrap()) ^ pending.seq;
+            pnonce[4..12].copy_from_slice(&tail.to_be_bytes());
+            let pnonce = *Nonce::from_slice(&pnonce);
+            match pending
+                .cipher
+                .decrypt_in_place_detached(&pnonce, header, payload, gcm_tag)
+            {
+                Ok(()) => {
+                    // Pending key succeeded — promote to primary permanently
+                    let p = self.pending.take().unwrap();
+                    self.cipher = p.cipher;
+                    self.base_nonce = p.base_nonce;
+                    self.seq = p.seq + 1;
+                    tracing::debug!("PFS rekey transition completed (pending key promoted)");
+                    return true;
+                }
+                Err(_) => {}
+            }
+        }
+
+        false
     }
 }
 
@@ -525,6 +631,234 @@ pub(crate) fn parse_inner_frame(inner: &[u8]) -> Option<(u8, &[u8])> {
     Some((cmd, &inner[INNER_HEADER_SIZE..INNER_HEADER_SIZE + data_len]))
 }
 
+/// Send an encrypted CMD_EPHEMERAL frame containing a 32-byte X25519 public key.
+pub(crate) async fn send_ephemeral_key(
+    write: &mut (impl AsyncWriteRent + ?Sized),
+    aead: &mut FrameAead,
+    pubkey: &[u8; 32],
+) -> std::io::Result<()> {
+    let data_len = 32usize;
+    let total_inner = INNER_HEADER_SIZE + data_len;
+    let frame_len = HMAC_SIZE + total_inner;
+
+    let mut buf = vec![0u8; TLS_HEADER_SIZE + frame_len];
+    buf[0] = APPLICATION_DATA;
+    buf[1] = TLS_MAJOR;
+    buf[2] = TLS_MINOR.0;
+    buf[3] = (frame_len >> 8) as u8;
+    buf[4] = frame_len as u8;
+
+    buf[TLS_HMAC_HEADER_SIZE] = CMD_EPHEMERAL;
+    buf[TLS_HMAC_HEADER_SIZE + 1] = (data_len >> 8) as u8;
+    buf[TLS_HMAC_HEADER_SIZE + 2] = data_len as u8;
+    buf[TLS_HMAC_HEADER_SIZE + INNER_HEADER_SIZE
+        ..TLS_HMAC_HEADER_SIZE + INNER_HEADER_SIZE + data_len]
+        .copy_from_slice(pubkey);
+
+    let header: [u8; TLS_HEADER_SIZE] = buf[..TLS_HEADER_SIZE].try_into().unwrap();
+    let tag = aead.encrypt_and_advance(&header, &mut buf[TLS_HMAC_HEADER_SIZE..]);
+    buf[TLS_HEADER_SIZE..TLS_HMAC_HEADER_SIZE].copy_from_slice(&tag);
+
+    let (res, _) = write.write_all(buf).await;
+    res?;
+    Ok(())
+}
+
+/// Read TLS frames, skipping unauthenticated handshake drain frames
+/// (NewSessionTickets, alerts), until a valid AEAD-encrypted CMD_EPHEMERAL
+/// frame with a 32-byte X25519 public key is found.
+///
+/// This is necessary because the server's handshake drain may still be
+/// relaying frames to the client when the ephemeral exchange begins.
+pub(crate) async fn read_ephemeral_key(
+    read: &mut (impl AsyncReadRent + ?Sized),
+    aead: &mut FrameAead,
+) -> std::io::Result<[u8; 32]> {
+    const TIMEOUT: Duration = Duration::from_secs(10);
+    const MAX_DRAIN_BYTES: usize = 64 * 1024;
+
+    let deadline = std::time::Instant::now() + TIMEOUT;
+    let mut drained_bytes: usize = 0;
+
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "ephemeral key exchange timed out",
+            ));
+        }
+
+        let frame = match monoio::time::timeout(remaining, read_single_tls_frame(read)).await {
+            Ok(r) => r?,
+            Err(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "ephemeral key exchange timed out",
+                ))
+            }
+        };
+
+        // Skip non-ApplicationData frames (alerts from handshake drain)
+        if frame[0] != APPLICATION_DATA || frame.len() <= TLS_HMAC_HEADER_SIZE {
+            drained_bytes += frame.len();
+            if drained_bytes > MAX_DRAIN_BYTES {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "too many drain bytes waiting for ephemeral key",
+                ));
+            }
+            tracing::trace!("ephemeral: skipping non-ApplicationData frame during drain");
+            continue;
+        }
+
+        let header: [u8; TLS_HEADER_SIZE] = frame[..TLS_HEADER_SIZE].try_into().unwrap();
+        let mut tag = [0u8; HMAC_SIZE];
+        tag.copy_from_slice(&frame[TLS_HEADER_SIZE..TLS_HMAC_HEADER_SIZE]);
+        let mut inner = frame[TLS_HMAC_HEADER_SIZE..].to_vec();
+
+        if !aead.decrypt_and_advance(&header, &mut inner, &tag) {
+            // Unauthenticated frame — likely NewSessionTicket from handshake drain.
+            // FrameAead does NOT advance seq on failure, so state stays clean.
+            drained_bytes += frame.len();
+            if drained_bytes > MAX_DRAIN_BYTES {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "too many drain bytes waiting for ephemeral key",
+                ));
+            }
+            tracing::trace!("ephemeral: skipping unauthenticated frame during drain");
+            continue;
+        }
+
+        match parse_inner_frame(&inner) {
+            Some((CMD_EPHEMERAL, data)) if data.len() == 32 => {
+                let mut key = [0u8; 32];
+                key.copy_from_slice(data);
+                return Ok(key);
+            }
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "expected CMD_EPHEMERAL but got different command",
+                ));
+            }
+        }
+    }
+}
+
+/// Read exactly one TLS record (header + body).
+async fn read_single_tls_frame(read: &mut (impl AsyncReadRent + ?Sized)) -> std::io::Result<Vec<u8>> {
+    let header = vec![0u8; TLS_HEADER_SIZE];
+    let (res, header) = read.read_exact(header).await;
+    res?;
+    let body_len = u16::from_be_bytes([header[3], header[4]]) as usize;
+    if body_len > 16384 + 256 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "TLS record too large",
+        ));
+    }
+    let mut frame = header;
+    frame.reserve(body_len);
+    let (res, frame_slice) = read
+        .read_exact(frame.slice_mut(TLS_HEADER_SIZE..TLS_HEADER_SIZE + body_len))
+        .await;
+    res?;
+    Ok(frame_slice.into_inner())
+}
+
+/// Read frames from a TLS stream after ephemeral key exchange, skipping padding,
+/// until the first CMD_DATA or CMD_MUX_SYN frame. Returns the inner payload.
+pub(crate) async fn read_first_data_frame(
+    read: &mut (impl AsyncReadRent + ?Sized),
+    aead: &mut FrameAead,
+) -> std::io::Result<Vec<u8>> {
+    const TIMEOUT: Duration = Duration::from_secs(30);
+    const MAX_PADDING_FRAMES: usize = 20;
+
+    let deadline = std::time::Instant::now() + TIMEOUT;
+
+    for _ in 0..MAX_PADDING_FRAMES {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "timed out waiting for first data frame after PFS rekey",
+            ));
+        }
+
+        let frame = match monoio::time::timeout(remaining, read_single_tls_frame(read)).await {
+            Ok(r) => r?,
+            Err(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "timed out waiting for first data frame after PFS rekey",
+                ))
+            }
+        };
+
+        if frame.len() <= TLS_HMAC_HEADER_SIZE || frame[0] != APPLICATION_DATA {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "unexpected non-ApplicationData frame after PFS rekey",
+            ));
+        }
+
+        let header: [u8; TLS_HEADER_SIZE] = frame[..TLS_HEADER_SIZE].try_into().unwrap();
+        let mut tag = [0u8; HMAC_SIZE];
+        tag.copy_from_slice(&frame[TLS_HEADER_SIZE..TLS_HMAC_HEADER_SIZE]);
+        let mut inner = frame[TLS_HMAC_HEADER_SIZE..].to_vec();
+
+        if !aead.decrypt_and_advance(&header, &mut inner, &tag) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "AEAD verification failed after PFS rekey",
+            ));
+        }
+
+        match parse_inner_frame(&inner) {
+            Some((CMD_DATA, data)) if !data.is_empty() => {
+                return Ok(data.to_vec());
+            }
+            Some((CMD_MUX_SYN, _)) => {
+                return Ok(inner);
+            }
+            Some((CMD_PADDING, _)) | Some((CMD_DATA, _)) => {
+                continue;
+            }
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "malformed inner frame after PFS rekey",
+                ));
+            }
+        }
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Other,
+        "too many padding frames after PFS rekey",
+    ))
+}
+
+/// Shared state for 0-RTT PFS rekey signaling between encrypt and decrypt tasks.
+///
+/// Created before entering relay. The decrypt task computes the DH shared secret
+/// when it receives CMD_EPHEMERAL, rekeys its own AEAD, and signals the encrypt
+/// task via `shared_secret`. The encrypt task checks this before each write.
+///
+/// Uses `Rc<Cell>` — safe because monoio is single-threaded.
+pub(crate) struct PfsContext {
+    pub(crate) our_secret: [u8; 32],
+    pub(crate) server_random: [u8; 32],
+    pub(crate) decrypt_dir: &'static [u8], // b"s2c" for client, b"c2s" for server
+    pub(crate) encrypt_dir: &'static [u8], // b"c2s" for client, b"s2c" for server
+    /// Set by the decrypt task after DH completes. Encrypt task takes it to rekey.
+    pub(crate) shared_secret: Cell<Option<[u8; 32]>>,
+}
+pub(crate) type PfsState = Rc<PfsContext>;
+
 pub(crate) async fn verified_relay(
     raw: TcpStream,
     tls: TcpStream,
@@ -543,6 +877,7 @@ pub(crate) async fn verified_relay(
         auth_pending,
         0,
         role,
+        None,
     )
     .await;
 }
@@ -556,6 +891,7 @@ pub(crate) async fn verified_relay_with_coalesce(
     auth_pending: bool,
     coalesce_ms: u64,
     role: TrafficRole,
+    pfs: Option<PfsState>,
 ) {
     tracing::debug!(
         "verified relay started (auth_pending={auth_pending}, coalesce_ms={coalesce_ms}, role={role:?})"
@@ -563,6 +899,10 @@ pub(crate) async fn verified_relay_with_coalesce(
     let (mut tls_read, mut tls_write) = tls.into_split();
     let (mut raw_read, mut raw_write) = raw.into_split();
     let (mut notfied, mut notifier) = local_sync::oneshot::channel::<()>();
+
+    // Clone for encrypt task — cheap Rc clone
+    let pfs_encrypt = pfs.clone();
+
     let _ = monoio::join!(
         async {
             copy_remove_appdata_and_decrypt(
@@ -571,6 +911,7 @@ pub(crate) async fn verified_relay_with_coalesce(
                 &mut aead_decrypt,
                 &mut notifier,
                 auth_pending,
+                pfs,
             )
             .await;
             let _ = raw_write.shutdown().await;
@@ -589,6 +930,7 @@ pub(crate) async fn verified_relay_with_coalesce(
                     alert_enabled,
                     coalesce_ms,
                     role,
+                    pfs_encrypt,
                 )
                 .await;
             } else {
@@ -599,6 +941,7 @@ pub(crate) async fn verified_relay_with_coalesce(
                     &mut notfied,
                     alert_enabled,
                     role,
+                    pfs_encrypt,
                 )
                 .await;
             }
@@ -642,6 +985,7 @@ async fn copy_remove_appdata_and_decrypt(
     aead: &mut FrameAead,
     alert_notifier: &mut Receiver<()>,
     auth_pending: bool,
+    pfs: Option<PfsState>,
 ) {
     /// Max bytes discarded during AuthPending before giving up.
     const AUTH_PENDING_MAX_BYTES: usize = 64 * 1024;
@@ -802,8 +1146,39 @@ async fn copy_remove_appdata_and_decrypt(
                         CMD_DATA => {
                             tracing::trace!("discarding empty data frame");
                         }
+                        CMD_EPHEMERAL
+                            if data_len == 32
+                                && inner.len() >= INNER_HEADER_SIZE + 32
+                                && pfs.is_some() =>
+                        {
+                            // 0-RTT PFS: received peer's ephemeral public key.
+                            // Compute DH shared secret, rekey decrypt AEAD,
+                            // and signal encrypt task via shared PfsContext.
+                            let ctx = pfs.as_ref().unwrap();
+                            let mut peer_key = [0u8; 32];
+                            peer_key.copy_from_slice(
+                                &inner[INNER_HEADER_SIZE..INNER_HEADER_SIZE + 32],
+                            );
+                            let our_secret =
+                                x25519_dalek::StaticSecret::from(ctx.our_secret);
+                            let peer_public = x25519_dalek::PublicKey::from(peer_key);
+                            let shared = our_secret.diffie_hellman(&peer_public);
+                            // Rekey decrypt AEAD (direction depends on role)
+                            aead.rekey(
+                                shared.as_bytes(),
+                                &ctx.server_random,
+                                ctx.decrypt_dir,
+                            );
+                            // Signal encrypt side with the shared secret
+                            ctx.shared_secret.set(Some(*shared.as_bytes()));
+                            tracing::debug!(
+                                "PFS: decrypt side rekeyed, signaling encrypt side"
+                            );
+                        }
                         _ => {
-                            tracing::warn!("malformed inner frame, disconnecting");
+                            tracing::warn!(
+                                "unknown inner command 0x{cmd:02x}, disconnecting"
+                            );
                             alert_notifier.close();
                             return;
                         }
@@ -868,6 +1243,7 @@ async fn copy_add_appdata_and_encrypt(
     alert_notified: &mut Sender<()>,
     alert_enabled: bool,
     role: TrafficRole,
+    pfs: Option<PfsState>,
 ) {
     // Buffer layout: [TLS_HDR:5][TAG:16][CMD:1][DATA_LEN:2][payload...][padding...]
     let mut buffer = Vec::with_capacity(ENCRYPT_BUF_SIZE);
@@ -879,6 +1255,13 @@ async fn copy_add_appdata_and_encrypt(
     let mut padding = PaddingState::new(role);
 
     loop {
+        // 0-RTT PFS: check if decrypt side has completed DH and signaled rekey
+        if let Some(ref ctx) = pfs {
+            if let Some(shared_secret) = ctx.shared_secret.take() {
+                aead.rekey(&shared_secret, &ctx.server_random, ctx.encrypt_dir);
+                tracing::debug!("PFS: encrypt side rekeyed");
+            }
+        }
         if alert_notified.is_closed() {
             send_alert(&mut write, alert_enabled).await;
             return;
@@ -969,6 +1352,7 @@ async fn copy_add_appdata_coalesced(
     alert_enabled: bool,
     coalesce_ms: u64,
     role: TrafficRole,
+    pfs: Option<PfsState>,
 ) {
     let mut buffer = Vec::with_capacity(ENCRYPT_BUF_SIZE);
     buffer.resize(FRAME_OVERHEAD, 0);
@@ -981,6 +1365,13 @@ async fn copy_add_appdata_coalesced(
     let mut packet_count: usize = 0;
 
     loop {
+        // 0-RTT PFS: check if decrypt side has completed DH and signaled rekey
+        if let Some(ref ctx) = pfs {
+            if let Some(shared_secret) = ctx.shared_secret.take() {
+                aead.rekey(&shared_secret, &ctx.server_random, ctx.encrypt_dir);
+                tracing::debug!("PFS: encrypt side rekeyed (coalesced)");
+            }
+        }
         if alert_notified.is_closed() {
             send_alert(&mut write, alert_enabled).await;
             return;

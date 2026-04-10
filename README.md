@@ -19,6 +19,12 @@ A TLS camouflage proxy that uses **trusted certificates from real servers**. Enh
 - HKDF-SHA256 密钥派生，方向独立密钥 (c2s/s2c)，64 位序号防重放
 - 内层 payload 加密（机密性 + 完整性），而非仅认证
 
+### 完美前向保密 / Perfect Forward Secrecy (PFS)
+- 握手后通过已认证 AEAD 通道进行 **X25519 临时密钥交换**
+- 非 Mux 模式 **0-RTT**：客户端发送公钥后立即开始数据传输，服务端异步响应
+- Mux 模式 1-RTT：开销在所有复用连接间分摊
+- 即使 password 未来泄露，历史流量无法解密
+
 ### 反检测强化 / Anti-Detection Hardening
 - 合成 Finished 精确匹配真实 TLS 1.3 大小（53/69 字节），防被动指纹检测
 - **方向感知 HTTP/2 流量模拟**：C2S/S2C 独立填充配置，匹配真实浏览器流量不对称性
@@ -103,7 +109,7 @@ curl --socks5 127.0.0.1:1080 http://captive.apple.com/
 
 ## How it Works
 
-Client side: performs a real TLS handshake using BoringSSL (Chrome's TLS library) for an authentic browser fingerprint. The server relays the handshake to a real TLS server, authenticates the client via a signed SessionID, and switches to encrypted data relay. All data is protected with per-frame AES-128-GCM. With mux enabled, multiple connections share a single TLS tunnel for zero-RTT subsequent connections.
+Client side: performs a real TLS handshake using BoringSSL (Chrome's TLS library) for an authentic browser fingerprint. The server relays the handshake to a real TLS server, authenticates the client via a signed SessionID, and switches to encrypted data relay. A post-handshake X25519 ephemeral key exchange provides perfect forward secrecy (0-RTT for non-mux, 1-RTT for mux). All data is protected with per-frame AES-128-GCM. With mux enabled, multiple connections share a single TLS tunnel for zero-RTT subsequent connections.
 
 ## Note
 This project relies on [Monoio](https://github.com/bytedance/monoio) (io_uring async runtime). It does not support Windows natively. Use environment variable `MONOIO_FORCE_LEGACY_DRIVER=1` to use epoll instead of io_uring.

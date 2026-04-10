@@ -100,7 +100,7 @@
 | 维度 | ShadowTLS (本项目) | 原版 ShadowTLS | AnyTLS | REALITY | Hysteria 2 | Naiveproxy | Meek |
 |------|:--:|:--:|:--:|:--:|:--:|:--:|:--:|
 | **数据加密** | AES-128-GCM | HMAC-SHA256 | TLS 1.3 原生 | TLS 1.3 + XTLS | TLS 1.3 (QUIC) | TLS 1.3 | TLS + Tor |
-| **前向保密** | HKDF(ServerRandom) | HKDF(ServerRandom) | TLS ECDHE | TLS ECDHE | QUIC ECDHE | TLS ECDHE | TLS + Tor |
+| **前向保密** | X25519 ECDHE (真正 PFS) | HKDF(ServerRandom) | TLS ECDHE | TLS ECDHE | QUIC ECDHE | TLS ECDHE | TLS + Tor |
 | **认证** | HMAC-SHA1(4B) + GCM | HMAC-SHA256(4B) | sha256(password) | X25519 + shortID | password + TLS | 用户名/密码 | Tor 匿名 |
 | **抗重放** | 64-bit GCM nonce | 有 | TLS 内建 | TLS 内建 | QUIC 内建 | TLS 内建 | HTTPS |
 
