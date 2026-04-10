@@ -21,8 +21,10 @@ A TLS camouflage proxy that uses **trusted certificates from real servers**. Enh
 
 ### 反检测强化 / Anti-Detection Hardening
 - 合成 Finished 精确匹配真实 TLS 1.3 大小（53/69 字节），防被动指纹检测
-- 随机化填充边界 [5,13] + 5% 尾部填充，消除 TLS-in-TLS 统计指纹
+- **方向感知 HTTP/2 流量模拟**：C2S/S2C 独立填充配置，匹配真实浏览器流量不对称性
+- **握手后前导记录**：1–3 个填充记录模拟 HTTP/2 SETTINGS 交换，消除握手→数据过渡指纹
 - NewSessionTickets 逐字转发，不修改帧长度（绕过 aparecium 类检测）
+- 受 [restls](https://github.com/3andne/restls) 流量脚本思路启发
 
 ### 多路复用 / Multiplexing (Mux)
 - 多连接共享单条 TLS 隧道，后续连接 **0 额外 RTT**

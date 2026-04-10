@@ -20,7 +20,8 @@ use serde::Deserialize;
 use crate::{
     util::{
         bind_with_pretty_error, copy_bidirectional, mod_tcp_conn, prelude::*,
-        resolve, support_tls13, verified_relay, CursorExt, FrameAead, Hmac, V3Mode,
+        resolve, support_tls13, verified_relay, CursorExt, FrameAead, Hmac,
+        TrafficRole, V3Mode,
     },
     WildcardSNI,
 };
@@ -382,6 +383,7 @@ impl ShadowTlsServer {
                 frame_aead_c2s,
                 !use_tls13,
                 false,
+                TrafficRole::Server,
             )
             .await;
         }

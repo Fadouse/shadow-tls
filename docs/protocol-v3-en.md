@@ -1,7 +1,7 @@
 ---
 title: ShadowTLS V3 Protocol
 date: 2023-02-06 11:00:00
-updated: 2026-04-09 00:00:00
+updated: 2026-04-10 00:00:00
 author: ihciah
 ---
 
@@ -154,19 +154,54 @@ Each encrypted payload carries a 3-byte inner header to prevent statistical fing
 - `CMD = 0x01` (DATA): real user data followed by optional padding.
 - `CMD = 0x00` (PADDING): pure waste frame, receiver discards entirely.
 
-### Padding Strategy
+### Padding Strategy (Direction-Aware HTTP/2 Traffic Mimicry)
 
-**Phase 1 — Initial shaping (packets 0–7):**
+Real HTTP/2 over TLS has strongly asymmetric traffic patterns: clients send small frames (connection preface, SETTINGS, HEADERS), servers send large frames (DATA up to 16 KB). Using the same padding profile for both directions is a detectable fingerprint. ShadowTLS uses **direction-aware padding** inspired by [restls](https://github.com/3andne/restls)'s traffic script approach.
+
+#### Post-Handshake Preamble Records
+
+Before any real data flows, each side sends **1–3 padding-only AEAD records** (CMD_PADDING) to mimic the HTTP/2 connection establishment phase (SETTINGS exchange). The preamble count is randomized per connection (weighted: 50% 1 record, 35% 2, 15% 3) to prevent "data always at record N" fingerprinting.
+
+| Role | Preamble record 0 | Subsequent preamble records |
+|------|-------------------|-----------------------------|
+| Client | 50 – 90 B (HTTP/2 preface + SETTINGS) | 25 – 60 B (SETTINGS_ACK, WINDOW_UPDATE) |
+| Server | 40 – 90 B (SETTINGS + SETTINGS_ACK) | 30 – 70 B (control frames) |
+
+The receiver's existing CMD_PADDING handling discards these transparently — no protocol change required. Cost: ~100–200 bytes total per connection, sent once.
+
+#### Client → Server (C2S) Profile
 
 | Packet | Target payload range | Mimics |
 |--------|---------------------|--------|
-| 0 | 200 – 600 B | HTTP request / small response |
-| 1 | 800 – 1400 B (5%: 14000 – 16000) | HTTP headers / large file |
-| 2–7 | 500 – 1400 B (5%: 14000 – 16000) | HTTP body chunks / large file |
+| 0 | 50 – 100 B | HTTP/2 connection preface (24B) + SETTINGS (~24B) |
+| 1 | 150 – 500 B | HTTP/2 HEADERS frame (GET/POST request) |
+| 2 | 50 – 300 B | WINDOW_UPDATE, SETTINGS_ACK, small body |
+| 3+ | 80 – 400 B (5%: 2000 – 8000) | Control frames / occasional large POST body |
 
-**Phase 2 — Tail padding (packets N+, where N is randomized per-connection in [5, 13]):**
+**Tail padding (packets N+, N randomized per-connection in [4, 10]):** 5% probability of 0–512 B.
 
-Each frame has a **5% probability** of 0–512 bytes of random padding, eliminating the abrupt statistical transition. The transition point N is randomized per-connection to prevent cross-connection fingerprinting of a fixed boundary.
+#### Server → Client (S2C) Profile
+
+| Packet | Target payload range | Mimics |
+|--------|---------------------|--------|
+| 0 | 40 – 100 B | HTTP/2 SETTINGS + SETTINGS_ACK |
+| 1 | 150 – 2000 B | Response HEADERS (+ possibly some DATA) |
+| 2+ | 500 – 4000 B (12%: 12000 – 16000) | DATA frames / large file streaming |
+
+**Tail padding (packets N+, N randomized per-connection in [5, 13]):** 8% probability of 0–1024 B.
+
+Server tail padding is heavier (higher probability, wider range) because real servers produce more variable-sized frames than clients.
+
+#### Comparison with Previous Padding
+
+| Property | Previous | Current |
+|----------|----------|---------|
+| Direction awareness | Same profile both ways | Separate C2S / S2C |
+| Initial sizes | 200–600 / 800–1400 | HTTP/2-realistic per direction |
+| Preamble records | None | 1–3 padding-only AEAD records |
+| Transition point | [5, 13] | C2S: [4, 10], S2C: [5, 13] |
+| Tail probability | 5% / 0–512 B | C2S: 5% / 0–512 B, S2C: 8% / 0–1024 B |
+| HTTP/2 mimicry | No | Yes (SETTINGS, HEADERS, DATA sizes) |
 
 # Security Properties
 
@@ -178,7 +213,10 @@ Each frame has a **5% probability** of 0–512 bytes of random padding, eliminat
 | Cross-session replay | HKDF salt = ServerRandom (unique per session) |
 | In-session replay/reorder | 64-bit sequence number in GCM nonce |
 | Header manipulation | TLS record header as GCM AAD |
-| TLS-in-TLS fingerprinting | Two-phase padding with realistic traffic distribution |
+| TLS-in-TLS fingerprinting | Direction-aware HTTP/2 padding + preamble records |
+| Handshake-to-data transition fingerprint | 1–3 preamble padding records mimic HTTP/2 SETTINGS exchange |
+| Traffic asymmetry fingerprint | Separate C2S (small) / S2C (large) padding profiles |
+| "Data at fixed record N" fingerprint | Randomized preamble count (1–3) per connection |
 | Inner payload inspection | AES-128-GCM encryption (confidentiality + integrity) |
 | Oversized TLS record truncation | All frames strictly ≤ 16384-byte standard limit |
 | Mux session hang | Dead session auto-detection + shutdown clears all streams |

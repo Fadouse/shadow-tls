@@ -29,7 +29,7 @@ use monoio::io::{AsyncReadRent, AsyncWriteRent, AsyncWriteRentExt, Splitable};
 use monoio::net::TcpStream;
 
 use crate::util::prelude::*;
-use crate::util::{mod_tcp_conn, resolve, FrameAead, PaddingState};
+use crate::util::{mod_tcp_conn, resolve, send_preamble, FrameAead, PaddingState, TrafficRole};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -464,11 +464,15 @@ pub(crate) async fn mux_write_loop(
     mut aead: FrameAead,
     session: Rc<MuxSession>,
     pool: Rc<BufPool>,
+    role: TrafficRole,
 ) {
+    // Send preamble padding records mimicking HTTP/2 SETTINGS exchange.
+    send_preamble(&mut tls_write, &mut aead, role).await;
+
     // Single buffer: [TLS_HDR:5][TAG:16][mux_frames...][padding...]
     // Frames are encoded directly here — no intermediate Vec allocation.
     let mut buffer = Vec::with_capacity(32768);
-    let mut padding = PaddingState::new();
+    let mut padding = PaddingState::new(role);
 
     // Encode a frame into buffer, then recycle any Data payload back to pool.
     #[inline]
@@ -776,7 +780,7 @@ pub(crate) async fn mux_server_dispatch(
     });
 
     // Run the write loop in the current task
-    mux_write_loop(tls_write, write_rx, aead_encrypt, session.clone(), pool).await;
+    mux_write_loop(tls_write, write_rx, aead_encrypt, session.clone(), pool, TrafficRole::Server).await;
 
     Ok(())
 }
@@ -881,7 +885,7 @@ pub(crate) fn create_client_session(
     let (tls_read, tls_write) = tls.into_split();
 
     // Spawn write loop (with pool for Data payload recycling)
-    monoio::spawn(mux_write_loop(tls_write, write_rx, aead_encrypt, session.clone(), pool.clone()));
+    monoio::spawn(mux_write_loop(tls_write, write_rx, aead_encrypt, session.clone(), pool.clone(), TrafficRole::Client));
 
     // Spawn read loop (shares BufPool with write side for buffer recycling)
     let session_for_read = session.clone();

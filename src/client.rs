@@ -13,7 +13,7 @@ use crate::{
     mux,
     util::{
         bind_with_pretty_error, mod_tcp_conn, resolve, verified_relay, FrameAead,
-        V3Mode,
+        TrafficRole, V3Mode,
     },
 };
 
@@ -261,6 +261,7 @@ impl ShadowTlsClient {
             frame_aead_s2c,
             !tls13,
             true,
+            TrafficRole::Client,
         )
         .await;
         Ok(())

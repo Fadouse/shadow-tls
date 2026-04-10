@@ -292,45 +292,75 @@ impl FrameAead {
     }
 }
 
-/// Padding state for anti TLS-in-TLS with realistic traffic distribution.
+/// Traffic role determines padding profiles and preamble behavior.
 ///
-/// Key improvements over naive fixed-boundary padding:
-///   1. **Randomized transition point**: the boundary between mandatory and
-///      probabilistic padding is randomized per-connection (range 5-13),
-///      preventing statistical fingerprinting of a fixed packet boundary.
-///   2. **Realistic traffic distribution**: mimics real HTTPS (HTTP/2) traffic
-///      patterns with variable frame sizes.
-///   3. **Higher tail padding**: 5% probability of 0-512B random padding after
-///      the initial phase, smoothing the statistical transition.
+/// Real HTTP/2 over TLS has asymmetric traffic patterns:
+///   - Client→Server: small initial frames (connection preface ~24B, SETTINGS ~24B,
+///     HEADERS ~150-500B), then variable request bodies.
+///   - Server→Client: small SETTINGS response, then large DATA frames (up to 16KB).
+///
+/// Using the same padding profile for both directions is a detectable fingerprint.
+/// Direction-aware profiles mimic real HTTP/2 frame size distributions.
+#[derive(Copy, Clone, Debug)]
+pub(crate) enum TrafficRole {
+    /// Encrypt direction is client→server (small initial records).
+    Client,
+    /// Encrypt direction is server→client (small initial, then large DATA).
+    Server,
+}
+
+/// Padding state for anti TLS-in-TLS with HTTP/2-realistic traffic distribution.
+///
+/// Key anti-detection features:
+///   1. **Direction-aware profiles**: C2S and S2C use different size distributions
+///      matching real HTTP/2 traffic asymmetry.
+///   2. **Randomized transition point**: boundary between mandatory and probabilistic
+///      padding is randomized per-connection, preventing statistical fingerprinting.
+///   3. **HTTP/2 frame size mimicry**: initial record sizes match real HTTP/2 control
+///      frames (SETTINGS ~40-90B, HEADERS ~150-500B, DATA ~500-16KB).
+///   4. **Probabilistic tail padding**: smooths the statistical transition from
+///      mandatory to minimal padding.
 pub(crate) struct PaddingState {
     sent: usize,
     /// Per-connection randomized transition point from mandatory to probabilistic padding.
     transition_point: usize,
+    /// Traffic role determines the size distribution profile.
+    role: TrafficRole,
 }
 
-/// Probability (out of 100) that initial-phase packets produce a near-full-size frame.
-const FULL_FRAME_PROBABILITY: u32 = 5;
-/// Near-full-size range when triggered (mimics large HTTPS response body).
-const FULL_FRAME_RANGE: (usize, usize) = (14000, 16000);
-/// Probability (out of 100) of post-initial-phase random padding.
-const TAIL_PADDING_PROBABILITY: u32 = 5;
-/// Max tail padding bytes.
-const TAIL_PADDING_MAX: usize = 512;
+/// Probability (out of 100) of post-initial-phase random padding (client).
+const TAIL_PADDING_PROBABILITY_C2S: u32 = 5;
+/// Probability (out of 100) of post-initial-phase random padding (server).
+/// Higher than client because real servers produce more variable-sized frames.
+const TAIL_PADDING_PROBABILITY_S2C: u32 = 8;
+/// Max tail padding bytes (client).
+const TAIL_PADDING_MAX_C2S: usize = 512;
+/// Max tail padding bytes (server — real servers have heavier tail).
+const TAIL_PADDING_MAX_S2C: usize = 1024;
 
 impl PaddingState {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(role: TrafficRole) -> Self {
         let mut rng = rand::thread_rng();
-        // Randomize transition point: sum of three small uniforms gives a
-        // roughly bell-shaped distribution centered around 9, range [5, 13].
-        // This eliminates the fixed-boundary fingerprint that an observer
-        // could detect across multiple connections.
-        let transition_point = 5
-            + rng.gen_range(0..=3u32) as usize
-            + rng.gen_range(0..=3u32) as usize
-            + rng.gen_range(0..=2u32) as usize;
+        // Randomize transition point: sum of small uniforms gives a roughly
+        // bell-shaped distribution, eliminating fixed-boundary fingerprints.
+        let transition_point = match role {
+            // Client: fewer mandatory records (HTTP/2 preface + SETTINGS + HEADERS)
+            TrafficRole::Client => {
+                4 + rng.gen_range(0..=2u32) as usize
+                  + rng.gen_range(0..=2u32) as usize
+                  + rng.gen_range(0..=2u32) as usize
+            }
+            // Server: more mandatory records (SETTINGS + HEADERS + DATA frames)
+            TrafficRole::Server => {
+                5 + rng.gen_range(0..=3u32) as usize
+                  + rng.gen_range(0..=3u32) as usize
+                  + rng.gen_range(0..=2u32) as usize
+            }
+        };
         Self {
             sent: 0,
             transition_point,
+            role,
         }
     }
 
@@ -338,44 +368,144 @@ impl PaddingState {
     /// `current_payload` = tag + inner header + data (before padding).
     ///
     /// During initial phase: pads to a target payload size (mandatory).
-    /// After transition: 5% chance of 0-512B extra padding (smooths the cutoff).
+    /// After transition: probabilistic tail padding (smooths the cutoff).
     pub(crate) fn next_padding_len(&mut self, current_payload: usize) -> usize {
         let mut rng = rand::thread_rng();
 
         if self.sent < self.transition_point {
-            let range = match self.sent {
-                0 => (200, 600), // HTTP request / small response
-                1 => {
-                    // HTTP response headers, with small chance of full-size
-                    if rng.gen_range(0..100u32) < FULL_FRAME_PROBABILITY {
-                        FULL_FRAME_RANGE
-                    } else {
-                        (800, 1400)
-                    }
-                }
-                _ => {
-                    // HTTP response body chunks, with small chance of full-size
-                    // (mimics real large file download producing max-size TLS records)
-                    if rng.gen_range(0..100u32) < FULL_FRAME_PROBABILITY {
-                        FULL_FRAME_RANGE
-                    } else {
-                        (500, 1400)
-                    }
-                }
+            let range = match self.role {
+                TrafficRole::Client => self.client_range(&mut rng),
+                TrafficRole::Server => self.server_range(&mut rng),
             };
             self.sent += 1;
             let target = rng.gen_range(range.0..=range.1);
             target.saturating_sub(current_payload)
         } else {
-            // Post-initial phase: probabilistic tail padding (5%).
-            // Higher probability and wider range than before to better smooth
-            // the statistical transition and resist traffic analysis.
             self.sent += 1;
-            if rng.gen_range(0..100u32) < TAIL_PADDING_PROBABILITY {
-                rng.gen_range(0..=TAIL_PADDING_MAX)
+            let (prob, max) = match self.role {
+                TrafficRole::Client => (TAIL_PADDING_PROBABILITY_C2S, TAIL_PADDING_MAX_C2S),
+                TrafficRole::Server => (TAIL_PADDING_PROBABILITY_S2C, TAIL_PADDING_MAX_S2C),
+            };
+            if rng.gen_range(0..100u32) < prob {
+                rng.gen_range(0..=max)
             } else {
                 0
             }
+        }
+    }
+
+    /// Client→Server padding targets mimicking real HTTP/2 browser traffic.
+    ///
+    /// Real Chrome HTTP/2 flow:
+    ///   Record 0: connection preface (24B) + SETTINGS (~24B) ≈ 50-90B encrypted
+    ///   Record 1: HEADERS frame (request) ≈ 150-500B encrypted
+    ///   Record 2+: small control frames, request body chunks ≈ 50-400B
+    fn client_range(&self, rng: &mut impl Rng) -> (usize, usize) {
+        match self.sent {
+            0 => (50, 100),    // HTTP/2 connection preface + SETTINGS
+            1 => (150, 500),   // HEADERS frame (GET/POST request)
+            2 => (50, 300),    // WINDOW_UPDATE, SETTINGS_ACK, small body
+            _ => {
+                // Subsequent: mostly small, occasional large request body
+                if rng.gen_range(0..100u32) < 5 {
+                    (2000, 8000)   // Large POST body
+                } else {
+                    (80, 400)
+                }
+            }
+        }
+    }
+
+    /// Server→Client padding targets mimicking real HTTP/2 server traffic.
+    ///
+    /// Real server HTTP/2 flow:
+    ///   Record 0: SETTINGS + SETTINGS_ACK ≈ 40-90B encrypted
+    ///   Record 1: response HEADERS ≈ 150-2000B (varies by headers count)
+    ///   Record 2+: DATA frames, often large (up to 16KB)
+    fn server_range(&self, rng: &mut impl Rng) -> (usize, usize) {
+        match self.sent {
+            0 => (40, 100),     // SETTINGS + SETTINGS_ACK
+            1 => (150, 2000),   // Response HEADERS (+ possibly some DATA)
+            _ => {
+                // DATA frames: servers send large records more often
+                if rng.gen_range(0..100u32) < 12 {
+                    (12000, 16000) // Near-max TLS record (large file/stream)
+                } else {
+                    (500, 4000)    // Typical DATA frame
+                }
+            }
+        }
+    }
+}
+
+/// Number of preamble padding records to send before real data.
+///
+/// Mimics HTTP/2 connection establishment: real browsers send SETTINGS
+/// frames before any request. Variable count (1-3) per connection
+/// prevents "data always at record N" fingerprinting.
+fn preamble_count() -> usize {
+    let mut rng = rand::thread_rng();
+    // Weighted: 1 record (50%), 2 records (35%), 3 records (15%)
+    match rng.gen_range(0..100u32) {
+        0..=49 => 1,
+        50..=84 => 2,
+        _ => 3,
+    }
+}
+
+/// Preamble record target sizes (total TLS record payload) for each record index.
+/// Mimics HTTP/2 SETTINGS exchange sizes.
+fn preamble_target_size(index: usize, role: TrafficRole) -> usize {
+    let mut rng = rand::thread_rng();
+    match (role, index) {
+        // Client: connection preface (24B) + SETTINGS (~24B)
+        (TrafficRole::Client, 0) => rng.gen_range(50..=90),
+        // Client: SETTINGS_ACK or WINDOW_UPDATE
+        (TrafficRole::Client, _) => rng.gen_range(25..=60),
+        // Server: SETTINGS + SETTINGS_ACK
+        (TrafficRole::Server, 0) => rng.gen_range(40..=90),
+        // Server: WINDOW_UPDATE or additional control frame
+        (TrafficRole::Server, _) => rng.gen_range(30..=70),
+    }
+}
+
+/// Send preamble padding-only AEAD records mimicking HTTP/2 connection setup.
+///
+/// Zero-cost in throughput: small records (~50-90 bytes) sent once per connection.
+/// The receiver's existing CMD_PADDING handling discards them transparently.
+pub(crate) async fn send_preamble(
+    write: &mut impl AsyncWriteRent,
+    aead: &mut FrameAead,
+    role: TrafficRole,
+) {
+    let count = preamble_count();
+    for i in 0..count {
+        let target = preamble_target_size(i, role);
+        // Minimum inner payload: INNER_HEADER_SIZE (cmd + len)
+        let pad_len = target.saturating_sub(HMAC_SIZE + INNER_HEADER_SIZE);
+        let total_inner = INNER_HEADER_SIZE + pad_len;
+        let frame_len = HMAC_SIZE + total_inner;
+
+        let mut buf = vec![0u8; TLS_HEADER_SIZE + frame_len];
+        buf[0] = APPLICATION_DATA;
+        buf[1] = TLS_MAJOR;
+        buf[2] = TLS_MINOR.0;
+        buf[3] = (frame_len >> 8) as u8;
+        buf[4] = frame_len as u8;
+
+        // Inner: CMD_PADDING + data_len=0 + zero padding
+        buf[TLS_HMAC_HEADER_SIZE] = CMD_PADDING;
+        buf[TLS_HMAC_HEADER_SIZE + 1] = 0;
+        buf[TLS_HMAC_HEADER_SIZE + 2] = 0;
+        // Padding bytes are already zero (inside AEAD, indistinguishable from random)
+
+        let header: [u8; TLS_HEADER_SIZE] = buf[..TLS_HEADER_SIZE].try_into().unwrap();
+        let tag = aead.encrypt_and_advance(&header, &mut buf[TLS_HMAC_HEADER_SIZE..]);
+        buf[TLS_HEADER_SIZE..TLS_HMAC_HEADER_SIZE].copy_from_slice(&tag);
+
+        let (res, _) = write.write_all(buf).await;
+        if res.is_err() {
+            return;
         }
     }
 }
@@ -402,6 +532,7 @@ pub(crate) async fn verified_relay(
     aead_decrypt: FrameAead,
     alert_enabled: bool,
     auth_pending: bool,
+    role: TrafficRole,
 ) {
     verified_relay_with_coalesce(
         raw,
@@ -411,6 +542,7 @@ pub(crate) async fn verified_relay(
         alert_enabled,
         auth_pending,
         0,
+        role,
     )
     .await;
 }
@@ -423,9 +555,10 @@ pub(crate) async fn verified_relay_with_coalesce(
     alert_enabled: bool,
     auth_pending: bool,
     coalesce_ms: u64,
+    role: TrafficRole,
 ) {
     tracing::debug!(
-        "verified relay started (auth_pending={auth_pending}, coalesce_ms={coalesce_ms})"
+        "verified relay started (auth_pending={auth_pending}, coalesce_ms={coalesce_ms}, role={role:?})"
     );
     let (mut tls_read, mut tls_write) = tls.into_split();
     let (mut raw_read, mut raw_write) = raw.into_split();
@@ -443,6 +576,10 @@ pub(crate) async fn verified_relay_with_coalesce(
             let _ = raw_write.shutdown().await;
         },
         async {
+            // Send preamble padding records mimicking HTTP/2 SETTINGS exchange
+            // before any real data, to reduce handshake-to-data transition fingerprint.
+            send_preamble(&mut tls_write, &mut aead_encrypt, role).await;
+
             if coalesce_ms > 0 {
                 copy_add_appdata_coalesced(
                     &mut raw_read,
@@ -451,6 +588,7 @@ pub(crate) async fn verified_relay_with_coalesce(
                     &mut notfied,
                     alert_enabled,
                     coalesce_ms,
+                    role,
                 )
                 .await;
             } else {
@@ -460,6 +598,7 @@ pub(crate) async fn verified_relay_with_coalesce(
                     &mut aead_encrypt,
                     &mut notfied,
                     alert_enabled,
+                    role,
                 )
                 .await;
             }
@@ -728,6 +867,7 @@ async fn copy_add_appdata_and_encrypt(
     aead: &mut FrameAead,
     alert_notified: &mut Sender<()>,
     alert_enabled: bool,
+    role: TrafficRole,
 ) {
     // Buffer layout: [TLS_HDR:5][TAG:16][CMD:1][DATA_LEN:2][payload...][padding...]
     let mut buffer = Vec::with_capacity(ENCRYPT_BUF_SIZE);
@@ -736,7 +876,7 @@ async fn copy_add_appdata_and_encrypt(
     buffer[1] = TLS_MAJOR;
     buffer[2] = TLS_MINOR.0;
 
-    let mut padding = PaddingState::new();
+    let mut padding = PaddingState::new(role);
 
     loop {
         if alert_notified.is_closed() {
@@ -828,6 +968,7 @@ async fn copy_add_appdata_coalesced(
     alert_notified: &mut Sender<()>,
     alert_enabled: bool,
     coalesce_ms: u64,
+    role: TrafficRole,
 ) {
     let mut buffer = Vec::with_capacity(ENCRYPT_BUF_SIZE);
     buffer.resize(FRAME_OVERHEAD, 0);
@@ -835,7 +976,7 @@ async fn copy_add_appdata_coalesced(
     buffer[1] = TLS_MAJOR;
     buffer[2] = TLS_MINOR.0;
 
-    let mut padding = PaddingState::new();
+    let mut padding = PaddingState::new(role);
     let coalesce_dur = Duration::from_millis(coalesce_ms);
     let mut packet_count: usize = 0;
 
