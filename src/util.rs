@@ -1628,12 +1628,25 @@ impl<T: AsyncReadRent> BufferFrameDecoder<T> {
         }
     }
 
+    /// Compact the buffer by moving unconsumed data to the front.
+    ///
+    /// Only compacts when remaining writable capacity (cap - len) is below a
+    /// full TLS record size (5 + 16384). This amortizes the memmove cost:
+    /// under high throughput most reads consume entire frames and compact
+    /// moves near-zero bytes; the threshold avoids pointless compaction
+    /// when plenty of space remains.
     #[inline]
     fn compact(&mut self) {
         if self.read_pos == 0 {
             return;
         }
         let buffer = self.buffer.as_mut().unwrap();
+        // Skip compaction if there's still enough room to read a full TLS record.
+        const MIN_FREE: usize = TLS_HEADER_SIZE + 16384;
+        let free = buffer.capacity() - buffer.len();
+        if free >= MIN_FREE {
+            return;
+        }
         let ptr = buffer.as_mut_ptr();
         let readable_len = buffer.len() - self.read_pos;
         unsafe {

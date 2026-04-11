@@ -42,9 +42,14 @@ const DEFAULT_STREAM_WINDOW: u32 = 256 * 1024;
 pub(crate) const MAX_MUX_DATA: usize = MAX_INNER_PAYLOAD - 7;
 /// Max streams per mux session.
 const DEFAULT_MAX_STREAMS: usize = 128;
+/// Proactive expansion threshold: create a new session when the least-loaded
+/// alive session already has this many active streams. Distributes load early
+/// rather than packing 128 streams onto one TCP connection before creating
+/// the next session.
+const EXPAND_THRESHOLD: usize = 16;
 /// Idle timeout for a mux session with no active streams.
-/// With keepalive pings every 15s resetting the timer, this only triggers
-/// when the ping loop itself has died (session shutdown, write channel closed).
+/// Pings keep the TCP alive for middleboxes but do NOT reset this timer,
+/// allowing pool shrink-back after traffic bursts.
 const MUX_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 /// Keepalive ping interval for idle mux sessions.
 const MUX_PING_INTERVAL: Duration = Duration::from_secs(15);
@@ -102,6 +107,19 @@ pub(crate) enum MuxFrame {
 }
 
 impl MuxFrame {
+    /// Return the number of bytes this frame will occupy when encoded.
+    /// Used by the write loop to check available space before encoding.
+    #[inline]
+    pub(crate) fn encoded_size(&self) -> usize {
+        match self {
+            MuxFrame::Syn { .. } => 1 + 4 + 2,         // cmd + sid + window
+            MuxFrame::Data { payload, .. } => 1 + 4 + 2 + payload.len(), // cmd + sid + len + data
+            MuxFrame::Fin { .. } | MuxFrame::Rst { .. } => 1 + 4, // cmd + sid
+            MuxFrame::Window { .. } => 1 + 4 + 4,       // cmd + sid + delta
+            MuxFrame::Ping { .. } | MuxFrame::Pong { .. } => 1 + 4, // cmd + pid
+        }
+    }
+
     /// Serialize this frame into the buffer (unencrypted inner payload format).
     pub(crate) fn encode(&self, buf: &mut Vec<u8>) {
         match self {
@@ -389,6 +407,9 @@ pub(crate) struct MuxPool {
     sessions: RefCell<Vec<(Rc<MuxSession>, Rc<BufPool>)>>,
     max_sessions: usize,
     creating: Cell<bool>,
+    /// Wakers of tasks waiting for a session to become available.
+    /// Drained (woken) when a session is added or the create lock is released.
+    waiters: RefCell<Vec<std::task::Waker>>,
 }
 
 impl MuxPool {
@@ -397,13 +418,21 @@ impl MuxPool {
             sessions: RefCell::new(Vec::new()),
             max_sessions,
             creating: Cell::new(false),
+            waiters: RefCell::new(Vec::new()),
         }
     }
 
-    /// Get a session with available capacity and its associated buffer pool.
+    /// Get the least-loaded session with available capacity and its buffer pool.
+    ///
+    /// Selects the alive session with the fewest active streams, distributing
+    /// new connections across all sessions instead of piling onto the first one.
     pub(crate) fn get_session(&self) -> Option<(Rc<MuxSession>, Rc<BufPool>)> {
         let sessions = self.sessions.borrow();
-        sessions.iter().find(|(s, _)| s.has_capacity()).cloned()
+        sessions
+            .iter()
+            .filter(|(s, _)| s.has_capacity())
+            .min_by_key(|(s, _)| s.active_count.get())
+            .cloned()
     }
 
     /// Try to acquire the creation lock. Returns true if this caller
@@ -418,17 +447,73 @@ impl MuxPool {
 
     pub(crate) fn unlock_create(&self) {
         self.creating.set(false);
+        self.wake_waiters();
     }
 
     /// Register a new session with its buffer pool. Evicts oldest idle if at capacity.
+    /// If the pool is full and no session can be evicted, the new session is NOT
+    /// added (the caller can still use it for the current connection; it just
+    /// won't be shared with future connections).
     pub(crate) fn add_session(&self, session: Rc<MuxSession>, pool: Rc<BufPool>) {
-        let mut sessions = self.sessions.borrow_mut();
-        if sessions.len() >= self.max_sessions {
-            if let Some(idx) = sessions.iter().position(|(s, _)| !s.is_alive() || s.active_count.get() == 0) {
-                sessions.swap_remove(idx);
+        {
+            let mut sessions = self.sessions.borrow_mut();
+            if sessions.len() >= self.max_sessions {
+                if let Some(idx) = sessions.iter().position(|(s, _)| !s.is_alive() || s.active_count.get() == 0) {
+                    sessions.swap_remove(idx);
+                } else {
+                    // All sessions are alive and active — hard cap prevents
+                    // unbounded pool growth. Session is still usable by caller.
+                    tracing::debug!("mux pool full ({} sessions), skipping add", self.max_sessions);
+                    return;
+                }
             }
+            sessions.push((session, pool));
         }
-        sessions.push((session, pool));
+        // Wake after releasing the sessions borrow so woken tasks can
+        // call get_session() without hitting a RefCell double-borrow.
+        self.wake_waiters();
+    }
+
+    /// Wake all tasks waiting for a session to become available.
+    fn wake_waiters(&self) {
+        let mut waiters = self.waiters.borrow_mut();
+        for w in waiters.drain(..) {
+            w.wake();
+        }
+    }
+
+    /// Suspend until a session becomes available or the create lock is released.
+    ///
+    /// Zero-cost wait: no polling, no sleep. The task registers its waker and
+    /// is woken instantly when `add_session` or `unlock_create` fires.
+    pub(crate) async fn wait_for_ready(&self) {
+        std::future::poll_fn(|cx| {
+            if self.get_session().is_some() || !self.creating.get() {
+                std::task::Poll::Ready(())
+            } else {
+                self.waiters.borrow_mut().push(cx.waker().clone());
+                std::task::Poll::Pending
+            }
+        })
+        .await
+    }
+
+    /// Returns true if the pool has room and all alive sessions are at or
+    /// above the expansion threshold. The caller should create a new session
+    /// to absorb future connections before existing sessions get overloaded.
+    pub(crate) fn should_expand(&self) -> bool {
+        let sessions = self.sessions.borrow();
+        if sessions.len() >= self.max_sessions {
+            return false;
+        }
+        if sessions.is_empty() {
+            return true;
+        }
+        // Expand when every alive session is above the threshold.
+        sessions
+            .iter()
+            .filter(|(s, _)| s.is_alive())
+            .all(|(s, _)| s.active_count.get() >= EXPAND_THRESHOLD)
     }
 
     /// Remove dead sessions and sessions idle longer than MUX_IDLE_TIMEOUT.
@@ -484,11 +569,19 @@ pub(crate) async fn mux_write_loop(
         }
     }
 
+    // Stash: holds a frame that was too large to fit in the current record.
+    // Used as the first frame of the next TLS record instead of recv().
+    let mut stash: Option<MuxFrame> = None;
+
     let _: () = async {
     loop {
-        let first = match rx.recv().await {
-            Some(f) => f,
-            None => return,
+        let first = if let Some(stashed) = stash.take() {
+            stashed
+        } else {
+            match rx.recv().await {
+                Some(f) => f,
+                None => return,
+            }
         };
 
         // Build TLS record header + tag placeholder
@@ -501,10 +594,36 @@ pub(crate) async fn mux_write_loop(
         // Encode first frame + recycle its Data payload if any
         encode_and_recycle(first, &mut buffer, &pool);
 
-        // Coalesce: drain channel for more frames (all recycled)
-        while buffer.len() - TLS_HMAC_HEADER_SIZE < MAX_INNER_PAYLOAD - 64 {
+        // Coalesce: yield once to let concurrent stream tasks enqueue frames,
+        // then drain everything available. Under high concurrency this packs
+        // many small frames into one TLS record, reducing syscall overhead.
+        //
+        // Frame-size-aware: check each frame's encoded size BEFORE encoding
+        // to prevent oversized TLS records. Frames that won't fit are stashed
+        // for the next record.
+        {
+            let mut yielded = false;
+            std::future::poll_fn(|cx| {
+                if yielded {
+                    std::task::Poll::Ready(())
+                } else {
+                    yielded = true;
+                    cx.waker().wake_by_ref();
+                    std::task::Poll::Pending
+                }
+            }).await;
+        }
+        while buffer.len() - TLS_HMAC_HEADER_SIZE < MAX_INNER_PAYLOAD {
             match rx.try_recv() {
-                Ok(f) => encode_and_recycle(f, &mut buffer, &pool),
+                Ok(f) => {
+                    let current_inner = buffer.len() - TLS_HMAC_HEADER_SIZE;
+                    if current_inner + f.encoded_size() > MAX_INNER_PAYLOAD {
+                        // Won't fit — stash for next record
+                        stash = Some(f);
+                        break;
+                    }
+                    encode_and_recycle(f, &mut buffer, &pool);
+                }
                 Err(_) => break,
             }
         }
@@ -892,7 +1011,14 @@ pub(crate) fn create_client_session(
     let pool_for_read = pool.clone();
     monoio::spawn(mux_read_loop(tls_read, session_for_read, aead_decrypt, true, pool_for_read));
 
-    // Spawn keepalive ping loop
+    // Spawn keepalive ping loop — only pings when session is idle.
+    // Active streams already keep the connection alive; pinging during
+    // high-throughput transfer wastes write loop bandwidth.
+    //
+    // Note: pings keep the TCP connection alive for middleboxes but do NOT
+    // reset the idle timer. This allows cleanup() to reclaim sessions that
+    // have been idle longer than MUX_IDLE_TIMEOUT, enabling pool shrink-back
+    // after traffic bursts.
     let session_for_ping = session.clone();
     monoio::spawn(async move {
         let mut ping_id: u32 = 0;
@@ -901,13 +1027,14 @@ pub(crate) fn create_client_session(
             if !session_for_ping.is_alive() {
                 return;
             }
+            // Skip ping when streams are active — they keep the session alive.
+            if session_for_ping.active_count.get() > 0 {
+                continue;
+            }
             ping_id = ping_id.wrapping_add(1);
             if session_for_ping.write_tx.send(MuxFrame::Ping { ping_id }).is_err() {
                 return;
             }
-            // Reset idle timer unconditionally. No TOCTOU: monoio single-threaded,
-            // no await points between here and end of block.
-            session_for_ping.idle_since.set(Some(Instant::now()));
         }
     });
 

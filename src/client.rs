@@ -178,7 +178,8 @@ impl ShadowTlsClient {
         let shared = Rc::new(self);
         // Mux pool: shared across all connections on this thread.
         // Each monoio thread gets its own pool (Rc, not Arc).
-        let mux_pool: Rc<mux::MuxPool> = Rc::new(mux::MuxPool::new(4));
+        // 8 sessions allows fine-grained load distribution under high concurrency.
+        let mux_pool: Rc<mux::MuxPool> = Rc::new(mux::MuxPool::new(8));
 
         // Prewarm: establish a mux session before the first connection arrives.
         // Periodic maintenance replaces dead/evicted sessions in the background.
@@ -191,9 +192,21 @@ impl ShadowTlsClient {
                     Err(e) => tracing::warn!("Mux: prewarm failed: {e:#}"),
                 }
                 loop {
-                    monoio::time::sleep(Duration::from_secs(5)).await;
+                    // Fast maintenance: 500ms lets us react to burst arrivals
+                    // by creating new sessions before existing ones saturate.
+                    monoio::time::sleep(Duration::from_millis(500)).await;
                     pool.cleanup();
-                    if pool.get_session().is_none() {
+                    if pool.should_expand() {
+                        // Proactive expansion: create directly (get_or_create would
+                        // just return the existing above-threshold session).
+                        if pool.try_lock_create() {
+                            match client.create_mux_session(&pool).await {
+                                Ok(_) => tracing::debug!("Mux: proactive expansion succeeded"),
+                                Err(e) => tracing::warn!("Mux: expansion failed: {e:#}"),
+                            }
+                            pool.unlock_create();
+                        }
+                    } else if pool.get_session().is_none() {
                         let _ = client.get_or_create_mux_session(&pool).await;
                     }
                 }
@@ -207,6 +220,22 @@ impl ShadowTlsClient {
                     let client = shared.clone();
                     let pool = mux_pool.clone();
                     mod_tcp_conn(&mut conn, true, shared.nodelay);
+
+                    // Proactive expansion: when all sessions are above threshold,
+                    // kick off a background session creation so that the NEXT
+                    // batch of connections gets a fresh, low-load session.
+                    if shared.mux && mux_pool.should_expand() && mux_pool.try_lock_create() {
+                        let expand_client = shared.clone();
+                        let expand_pool = mux_pool.clone();
+                        monoio::spawn(async move {
+                            match expand_client.create_mux_session(&expand_pool).await {
+                                Ok(_) => tracing::debug!("Mux: proactive expansion succeeded"),
+                                Err(e) => tracing::debug!("Mux: proactive expansion failed: {e:#}"),
+                            }
+                            expand_pool.unlock_create();
+                        });
+                    }
+
                     monoio::spawn(async move {
                         let result = if client.mux {
                             client.relay_mux(conn, &pool).await
@@ -287,13 +316,12 @@ impl ShadowTlsClient {
     }
 
     /// Obtain a mux session and its buffer pool: reuse existing or create new.
-    /// Only one task creates a session at a time; others poll and wait.
+    /// Only one task creates a session at a time; others await notification.
     async fn get_or_create_mux_session(
         &self,
         pool: &mux::MuxPool,
     ) -> anyhow::Result<(Rc<mux::MuxSession>, Rc<mux::BufPool>)> {
         const WAIT_TIMEOUT: Duration = Duration::from_secs(15);
-        const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
         let deadline = Instant::now() + WAIT_TIMEOUT;
 
@@ -309,8 +337,14 @@ impl ShadowTlsClient {
             }
 
             if !pool.try_lock_create() {
-                monoio::time::sleep(POLL_INTERVAL).await;
-                continue;
+                // Suspend until the creator finishes — zero-cost, no polling.
+                // wait_for_ready() returns instantly when add_session() or
+                // unlock_create() fires via Waker notification.
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                match monoio::time::timeout(remaining, pool.wait_for_ready()).await {
+                    Ok(()) => continue,
+                    Err(_) => anyhow::bail!("mux: timed out waiting for session"),
+                }
             }
 
             // Double-check after acquiring lock
